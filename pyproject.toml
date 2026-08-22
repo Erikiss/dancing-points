@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-config --strict-markers"
+
+[tool.coverage.run]
+branch = true
+source = ["."]
+omit = ["tests/*", "Library/AdamWR/*"]

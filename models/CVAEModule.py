@@ -84,6 +84,11 @@ class CVAEModel(nn.Module):
             self.activation = self.normalize
         elif activation_codebook == 'none':
             self.activation = lambda x: (x, None)
+        else:
+            raise ValueError(
+                "activation_codebook must be one of: softmax, normalize, none; "
+                f"got {activation_codebook!r}"
+            )
 
         print("Training End-To-End")
         self.Encoder = LinearEncoder(output_dim + input_dim, encoder_dim, encoder_dim, codebook_size, dropout)

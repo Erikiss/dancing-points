@@ -1,9 +1,7 @@
-import os
-import os.path as osp
+from pathlib import Path
 
 from tqdm import tqdm
 
-import Library.Utility as utility
 import Library.AdamWR.adamw as adamw
 import Library.AdamWR.cyclic_scheduler as cyclic_scheduler
 import torch
@@ -13,8 +11,7 @@ from utils.loss_recorder import LossRecorder
 
 from paired_dataset import create_dataset_from_args
 from modules import RunningNormalizeModel
-
-from utils.running_statics import RunningStatistics
+from runtime_utils import prepare_log_dir, resolve_device, seed_everything, seed_worker
 from unified_utils import model_dispatch
 
 import data_process.data_processors as data_processors
@@ -29,31 +26,28 @@ def main():
     else:
         data_processor = model.ExpectedDataProcessor()
 
-    Save = args.save
-    utility.MakeDirectory(Save)
-    with open(osp.join(Save, "args.txt"), "w") as file:
-        file.write(model_str + " " + option_parser.text_serialize(args))
+    serialized_args = model_str + " " + option_parser.text_serialize(args)
     args = option_parser.post_process(args)
-
-    log_dir = osp.join(Save, 'log')
-    if os.path.exists(log_dir) and 'test' not in log_dir:
-        print('log dir exists, remove it [y/n]?')
-        if input() != 'y':
-            print('exit')
-            return
-    if osp.exists(log_dir):
-        os.system(f'rm -rf {log_dir}')
-    summary_writer = SummaryWriter(log_dir)
-    loss_recorder = LossRecorder(summary_writer)
+    seed_everything(args.seed, deterministic=bool(args.deterministic))
+    device = resolve_device(args.device)
+    print(f'Device: {device}; seed: {args.seed}; deterministic: {bool(args.deterministic)}')
 
     motion_data = create_dataset_from_args(args)
+
+    Save = Path(args.save)
+    log_dir = prepare_log_dir(Save / 'log', overwrite=bool(args.overwrite_log))
+    with open(Save / "args.txt", "w") as file:
+        file.write(serialized_args)
+
+    summary_writer = SummaryWriter(str(log_dir))
+    loss_recorder = LossRecorder(summary_writer)
 
     # Build network model
     network = model.create_model_from_args(args, motion_data, data_processor)
 
     if args.running_normalize:
         network = RunningNormalizeModel(network)
-    network = utility.ToDevice(network)
+    network = network.to(device)
 
     params = network.parameters()
 
@@ -63,10 +57,19 @@ def main():
                                                       epoch_size=len(motion_data),
                                                       restart_period=args.restart_period, t_mult=args.restart_mult,
                                                       policy="cosine", verbose=True)
-    data_loader = DataLoader(motion_data, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True,
-                               pin_memory=True)
-
-    r_s = RunningStatistics()
+    data_generator = torch.Generator()
+    data_generator.manual_seed(args.seed)
+    use_pinned_memory = device.type == 'cuda'
+    data_loader = DataLoader(
+        motion_data,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=True,
+        pin_memory=use_pinned_memory,
+        worker_init_fn=seed_worker if args.num_workers > 0 else None,
+        generator=data_generator,
+    )
 
     for epoch in range(args.epochs):
         scheduler.step()
@@ -88,14 +91,15 @@ def main():
             if args.noise_level > 0:
                 input_data = input_data + torch.randn_like(input_data) * args.noise_level
 
-            input_data = utility.ToDevice(input_data)
-            follow_output = utility.ToDevice(follow_output)
-
-            r_s.update(input_data)
+            input_data = input_data.to(device, non_blocking=use_pinned_memory)
+            follow_output = follow_output.to(device, non_blocking=use_pinned_memory)
 
             losses, _ = network.learn(input_data, follow_output)
 
-            loss_total = sum([losses[k] * getattr(args, f'lambda_{k}') for k in losses], torch.tensor(0.0).to(input_data.device))
+            loss_total = sum(
+                [losses[k] * getattr(args, f'lambda_{k}') for k in losses],
+                torch.zeros((), device=input_data.device),
+            )
 
             for k in losses:
                 loss_recorder.add_scalar(f'loss_{k}', losses[k].item())
@@ -119,7 +123,7 @@ def main():
             break
 
         if (epoch + 1) % args.save_freq == 0 or epoch == args.epochs - 1:
-            torch.save(network.state_dict(), f'{Save}/{epoch + 1:04d}.pt')
+            torch.save(network.state_dict(), Save / f'{epoch + 1:04d}.pt')
 
         loss_recorder.epoch()
 
