@@ -1,0 +1,10 @@
+# Reference environment used by the original Dancing Points release.
+# Install the CUDA-specific PyTorch wheel appropriate for the target machine
+# before this file when the default PyPI wheel is not suitable.
+torch==2.1.1
+onnx==1.13.1
+numpy==1.26.0
+matplotlib==3.8.0
+tqdm==4.65.0
+tensorboard==2.12.1
+Pillow==10.1.0

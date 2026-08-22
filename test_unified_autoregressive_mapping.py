@@ -13,6 +13,7 @@ from option import TestOptionParser
 from paired_dataset import create_dataset_from_args, PairedDatasetTestView
 from onnx_helpers import export_named_onnx_autoregressive_mlp
 from modules import RunningNormalizeModel
+from runtime_utils import resolve_device, seed_everything, seed_worker
 
 from unified_utils import model_dispatch
 import data_process.data_processors as data_processors
@@ -53,9 +54,6 @@ class SpecificChannelLoss:
 def main():
     test_option_parser = TestOptionParser()
     test_args = test_option_parser.parse_args()
-    n_sample = 100
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     to_save = {}
 
@@ -68,6 +66,13 @@ def main():
             option_parser = model.TrainOption()
             args = option_parser.text_deserialize(remaining_args)
             args = option_parser.post_process(args)
+
+    seed = args.seed if test_args.seed is None else test_args.seed
+    seed_everything(seed, deterministic=bool(args.deterministic))
+    device = resolve_device(test_args.device)
+    print(f'Device: {device}; seed: {seed}; deterministic: {bool(args.deterministic)}')
+    to_save['seed'] = seed
+    to_save['device'] = str(device)
 
     if args.data_processor_type != 'Unknown':
         data_processor = data_processors.processor_dispatcher(args.data_processor_type)
@@ -155,6 +160,7 @@ def main():
     print('Root motion std:', out_data.data_std[..., root_sli])
 
     meta_dict['fps'] = str(motion_data.datas[0].target_fps)
+    meta_dict['seed'] = str(seed)
     meta_dict['use_relative_root_motion'] = str(motion_data.use_relative_root_motion)
     meta_dict['use_delta_root_motion'] = str(motion_data.use_delta_root_motion)
     meta_dict['no_root_derivative'] = str(motion_data.no_root_derivative)
@@ -177,16 +183,45 @@ def main():
                                              dynamic_axes=dynamic_axes, meta_dict=meta_dict)
 
     loss_function = torch.nn.MSELoss()
-    data_loader = DataLoader(motion_data, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True, pin_memory=True)
+    train_generator = torch.Generator().manual_seed(seed)
+    test_generator = torch.Generator().manual_seed(seed + 1)
+    use_pinned_memory = device.type == 'cuda'
+    data_loader = DataLoader(
+        motion_data,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=test_args.num_workers,
+        drop_last=True,
+        pin_memory=use_pinned_memory,
+        worker_init_fn=seed_worker if test_args.num_workers > 0 else None,
+        generator=train_generator,
+    )
     if args.test_sequence_ratio == 0:
         test_data_loader = data_loader
     else:
-        test_data_loader = DataLoader(PairedDatasetTestView(motion_data), batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True, pin_memory=True)
+        test_data_loader = DataLoader(
+            PairedDatasetTestView(motion_data),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=test_args.num_workers,
+            drop_last=True,
+            pin_memory=use_pinned_memory,
+            worker_init_fn=seed_worker if test_args.num_workers > 0 else None,
+            generator=test_generator,
+        )
 
     # Short sequence evaluation
     iterator = iter(data_loader)
     test_iterator = iter(test_data_loader)
-    n_sample = min(n_sample, len(test_data_loader) - 2)
+    requested_samples = max(2, test_args.num_samples)
+    n_test_samples = min((requested_samples + 1) // 2, len(test_data_loader))
+    n_train_samples = min(requested_samples // 2, len(data_loader))
+    if n_test_samples == 0 or n_train_samples == 0:
+        raise ValueError(
+            'evaluation requires at least one full training and test batch; '
+            'reduce --batch_size or provide more data'
+        )
+    n_sample = n_test_samples + n_train_samples
     loop = tqdm(range(n_sample))
     losses = []
     losses_test = []
@@ -211,7 +246,7 @@ def main():
     network.eval()
     for i in loop:
         # Run model prediction
-        training = i > n_sample // 2
+        training = i >= n_test_samples
 
         if training:
             losses_array = losses
@@ -229,8 +264,8 @@ def main():
             train_batch = next(test_iterator)
 
         input_data, follow_output = data_processor.ready_input_output(train_batch, args, motion_data)
-        input_data = input_data.to(device)
-        follow_output = follow_output.to(device)
+        input_data = input_data.to(device, non_blocking=use_pinned_memory)
+        follow_output = follow_output.to(device, non_blocking=use_pinned_memory)
         
         # diffusion_loss, _ = network.learn(input_data, follow_output)
         # diffusion_losses.append(diffusion_loss['rec'].detach().cpu().item())

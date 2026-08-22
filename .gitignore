@@ -74,6 +74,16 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Dancing Points datasets, checkpoints, exports, and run artifacts
+Datasets/
+results/
+checkpoints.tar
+datasets.tar
+*.pt
+*.onnx
+summary_data.pickle
+events.out.tfevents.*
+
 # pyenv
 .python-version
 
@@ -104,6 +114,9 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Ruff
+.ruff_cache/
 
 # temporary files
 .DS_Store

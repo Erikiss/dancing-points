@@ -33,6 +33,18 @@ packages (and their dependencies):
 - tqdm == 4.65.0
 - tensorboard == 2.12.1
 
+For a reproducible Python 3.11 environment, use the checked-in dependency files:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+For CUDA systems, install the PyTorch 2.1.1 wheel matching the machine's CUDA runtime before the
+remaining dependencies. Development and smoke-test dependencies are in `requirements-dev.txt`.
+
 ## Quick Start
 
 We provide pre-trained checkpoints for six ballroom-dancing styles (balboa, cha-cha, foxtrot, free,
@@ -102,6 +114,17 @@ what actually varies per run: `--paths`/`--data_name_filter` (which dataset(s)) 
 to write it). Every flag is still overridable on the command line if you want to deviate from the
 shipped recipe.
 
+### Reproducible and non-interactive runs
+
+Training now defaults to seed `23456`, records it in `args.txt`, seeds DataLoader workers, and uses
+deterministic cuDNN behavior. `--device=auto` (or the legacy empty default) chooses CUDA when it is
+available and otherwise uses CPU; pass `--device=cuda` or `--device=cpu` to require a specific
+device. Change `--num_workers` when the host has different multiprocessing constraints.
+
+If a run's TensorBoard log already exists, training exits instead of prompting or deleting it.
+Only an explicit `--overwrite_log=1` replaces that run's `log/` directory. Evaluation reuses the
+training seed by default; `--seed=<n>` can override it for a controlled comparison.
+
 ### Full example: training all four networks for balboa
 
 All four networks use the same combined, multi-style `Dance-All-2-3pt` (leader) /
@@ -168,6 +191,20 @@ A couple of caveats about this specific set of checkpoints:
 
 The preprocessed datasets above are derived from raw motion-captured skeletal animation. The
 original data, in FBX format, is available [here](https://drive.google.com/file/d/1FqiUV1l014aDtSXyd-tE3aIEs70Y5rlg/view?usp=share_link).
+
+## Tests
+
+The CPU smoke suite covers deterministic runtime setup, safe log handling, model dispatch, MLP and
+CVAE forward/loss shapes, and deterministic CVAE inference:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The same suite runs automatically for pull requests through GitHub Actions. Full dataset and
+checkpoint evaluation remains an explicit integration test because those assets are distributed
+separately.
 
 ## Acknowledgments
 

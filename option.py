@@ -64,6 +64,20 @@ class TestOptionParser(BaseOptionParser):
         self.parser.add_argument('--load_epoch', type=int, default=-1)
         self.parser.add_argument('--unity_input', type=str, default='')
         self.parser.add_argument('--export_onnx', type=int, default=1)
+        self.parser.add_argument('--seed', type=int, default=None)
+        self.parser.add_argument('--device', type=str, default='auto')
+        self.parser.add_argument('--num_workers', type=int, default=0)
+        self.parser.add_argument('--num_samples', type=int, default=100)
+
+    @staticmethod
+    def checker(args):
+        if args.seed is not None and args.seed < 0:
+            raise ValueError('seed must be non-negative')
+        if args.num_workers < 0:
+            raise ValueError('num_workers must be non-negative')
+        if args.num_samples < 2:
+            raise ValueError('num_samples must be at least 2')
+        return args
 
 
 class MLPMappingOption(BaseOptionParser):
@@ -111,6 +125,10 @@ class MLPMappingOption(BaseOptionParser):
         self.parser.add_argument('--lambda_rec', type=float, default=1)
         self.parser.add_argument('--batch_size', type=int, default=32)
         self.parser.add_argument('--device', type=str, default='')
+        self.parser.add_argument('--seed', type=int, default=23456)
+        self.parser.add_argument('--deterministic', type=int, default=1)
+        self.parser.add_argument('--num_workers', type=int, default=4)
+        self.parser.add_argument('--overwrite_log', type=int, default=0)
 
         self.parser.add_argument('--learning_rate', type=float, default=5e-5)
         self.parser.add_argument('--weight_decay', type=float, default=1e-4)
@@ -120,6 +138,12 @@ class MLPMappingOption(BaseOptionParser):
 
     @staticmethod
     def post_process(args):
+        if args.seed < 0:
+            raise ValueError('seed must be non-negative')
+        if args.num_workers < 0:
+            raise ValueError('num_workers must be non-negative')
+        if args.batch_size <= 0:
+            raise ValueError('batch_size must be positive')
         if isinstance(args.paths, str):
             args.paths = args.paths.split(',')
         if isinstance(args.path4manifolds, str):
