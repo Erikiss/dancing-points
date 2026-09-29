@@ -59,8 +59,19 @@ export class SceneKit {
     if (this.container && !opts.canvas) this.container.appendChild(renderer.domElement);
     renderer.domElement.addEventListener('webglcontextlost', (e) => {
       e.preventDefault();
+      this.contextLost = true;
       console.warn('[scene] WebGL context lost');
+      if (typeof this.onContextLost === 'function') this.onContextLost();
     });
+    // three.js cannot rebuild every GPU resource after a loss (memory pressure when the Quest
+    // browser is backgrounded); the App reloads the page instead of showing a black canvas
+    renderer.domElement.addEventListener('webglcontextrestored', () => {
+      console.warn('[scene] WebGL context restored');
+      if (typeof this.onContextRestored === 'function') this.onContextRestored();
+    });
+    this.contextLost = false;
+    this.onContextLost = null;
+    this.onContextRestored = null;
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(70, 1, 0.05, 80);
@@ -89,10 +100,19 @@ export class SceneKit {
 
     this.xrSession = null;
     this.onSessionEnd = null;
+    this.onReferenceSpaceReset = null;   // Oculus-button recentre: the local-floor frame moved
+    this.onVisibilityChange = null;      // session.visibilityState: 'visible' | 'visible-blurred' | 'hidden'
     this._onSessionEndEvent = () => {
       const s = this.xrSession;
       this.xrSession = null;
       if (typeof this.onSessionEnd === 'function') this.onSessionEnd(s);
+    };
+    this._onResetEvent = (ev) => {
+      if (typeof this.onReferenceSpaceReset === 'function') this.onReferenceSpaceReset(ev);
+    };
+    this._onVisibilityEvent = () => {
+      const s = this.xrSession;
+      if (s && typeof this.onVisibilityChange === 'function') this.onVisibilityChange(s.visibilityState);
     };
   }
 
@@ -277,8 +297,13 @@ export class SceneKit {
   async startXR(session) {
     this.xrSession = session;
     session.addEventListener('end', this._onSessionEndEvent);
+    session.addEventListener('visibilitychange', this._onVisibilityEvent);
     await this.renderer.xr.setSession(session);
-    return this.renderer.xr.getReferenceSpace();
+    const ref = this.renderer.xr.getReferenceSpace();
+    // a recentre (long press on the Oculus button) changes origin + yaw of 'local-floor'; the
+    // persisted calibration is then wrong and must be redone (App.onReferenceSpaceReset)
+    if (ref && typeof ref.addEventListener === 'function') ref.addEventListener('reset', this._onResetEvent);
+    return ref;
   }
 
   get referenceSpace() {

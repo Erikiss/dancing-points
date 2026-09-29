@@ -197,6 +197,26 @@ export class AudioEngine {
     }
   }
 
+  /**
+   * Pause/resume support for a loaded track (the synth pattern follows the clock by itself:
+   * `update()` schedules nothing while `clock.paused`). Call `pauseTrack()` after
+   * `clock.pause()` and `resumeTrack()` after `clock.resume()`; the track restarts at the
+   * clock's current position.
+   */
+  pauseTrack() {
+    if (!this._trackSource) return false;
+    try { this._trackSource.stop(); } catch (e) { /* already stopped */ }
+    try { this._trackSource.disconnect(); } catch (e) { /* ignore */ }
+    this._trackSource = null;
+    return true;
+  }
+
+  resumeTrack() {
+    if (!this.playing || !this.track || !this.clock || this._trackSource) return false;
+    this._startTrack();
+    return !!this._trackSource;
+  }
+
   /** Schedule all events inside the lookahead window. Call once per frame. */
   update() {
     if (!this.ctx || !this.playing || !this.clock || !this.clock.running || this.clock.paused) return;

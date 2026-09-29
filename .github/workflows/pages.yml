@@ -1,7 +1,11 @@
 # pages.yml - publish the static WebXR app (webxr/) to GitHub Pages. The int8 models (~85 MB in
-# two files) stay under the 100 MB per-file limit; the site is served over HTTPS, which WebXR
-# requires. Without a LAN server the app runs fully offline (results in localStorage; the duo
-# online mode needs `?server=` pointing at server/server.js).
+# two files) stay under the 100 MB per-file limit; the site is served over HTTPS with a trusted
+# certificate, which WebXR and the service worker (offline start, model cache) require. The app
+# needs an HTTP(S) origin - it does not boot from file:// (ES modules) - so Pages or
+# server/server.js are the two ways to run it. Without a LAN server results stay in
+# localStorage; the duo online mode needs `?server=` pointing at server/server.js.
+# One-time setup: repository Settings -> Pages -> Source: "GitHub Actions" (configure-pages
+# below does it with `enablement: true` when the token may administer Pages).
 name: Deploy to GitHub Pages
 
 on:
@@ -27,6 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: webxr

@@ -20,7 +20,7 @@ Language: code + comments in English, **player‑facing UI text in German** (arc
 |---|---|
 | "Fast‑shot solution that runs stable on Quest 2 and that I can try right away" | Static WebXR app (three.js), zero build step, opened in the Quest Browser. Also installable as PWA and packageable to an APK with Meta's `ovr-platform-util create-pwa`. |
 | Performant | 72 Hz render loop, tiny scene, all heavy work (neural nets) in a Web Worker at 30 Hz, int8‑quantized ONNX, automatic fallback to a light avatar when the device is too slow. |
-| Extendable for online/WLAN operation, own songs, own TikTok dances | Choreographies are JSON files (§5). A small Node server (`server/`) serves the app over HTTPS in the LAN, stores uploaded choreographies/results and relays duo‑mode state over WebSocket. The app also works fully offline from GitHub Pages / a USB stick. |
+| Extendable for online/WLAN operation, own songs, own TikTok dances | Choreographies are JSON files (§5). A small Node server (`server/`) serves the app over HTTPS in the LAN, stores uploaded choreographies/results and relays duo‑mode state over WebSocket. The app needs an HTTP(S) origin (ES modules + WebXR secure context: it does not boot from `file://`, so there is no USB‑stick mode); without a server it runs from GitHub Pages with results in `localStorage`. Offline start / model caching through the service worker need a **trusted** certificate (GitHub Pages, or `server.js --cert/--key`): Chromium refuses a service worker on a clicked‑through self‑signed certificate. |
 | Improve the network later (mechanistic interpretability etc.) | The network is a drop‑in ONNX file + `meta.json`; the runtime pipeline is a documented, tested port of the Python/Unity feature pipeline (§6). A telemetry toggle records every network input/output frame for offline analysis. |
 | Menu, scored dances, 30 s sequences, Snoop Dogg C‑Walk with 6 combos | §4, §5, `webxr/choreos/snoop-cwalk.json`. |
 | Duo mode with a metric / small benchmark | §7. |
@@ -37,7 +37,7 @@ port reuses it 1:1.
 webxr/                      the app (static; open index.html via any static server)
   index.html                import map (three -> ./vendor/three.module.js), boots src/app.js
   manifest.webmanifest      PWA manifest (name "Dancing Points VR")
-  sw.js                     service worker: cache-first for app shell + models, network-first for /api
+  sw.js                     service worker: network-first shell (src/, choreos/), cache-first assets (vendor/, models), network-first /api
   vendor/three.module.js    three r170 (vendored, MIT)
   vendor/ort/ort.wasm.min.js, ort-wasm-simd-threaded.{wasm,mjs}   onnxruntime-web 1.20.1 (vendored, MIT)
   models/free/              free-style models (int8) + meta.json + skeleton.json + init_pose.json   (§6)
@@ -87,8 +87,9 @@ README.md                   operator/player documentation (German section added 
 .github/workflows/pages.yml deploy webxr/ to GitHub Pages
 ```
 
-ES modules only, no bundler, no TypeScript. Node ≥ 18 for tools/tests/server. Python ≥ 3.11 with
-`numpy`, `onnx`, `onnxruntime` for `tools/*.py` (no PyTorch needed at runtime).
+ES modules only, no bundler, no TypeScript. Node ≥ 20 for the repository tooling (root
+`package.json`: `playwright-core` requires 20), the server alone runs on Node ≥ 18. Python ≥ 3.11
+with `numpy`, `onnx`, `onnxruntime` for `tools/*.py` (no PyTorch needed at runtime).
 
 ---
 
@@ -1158,11 +1159,17 @@ py)`), `panel.refresh()` re-layouts, `panel.invalidate()` redraws. Panels create
 starten" → `app.enterVR()` requesting `immersive-vr` with `requiredFeatures: ['local-floor']`,
 `optionalFeatures: ['hand-tracking', 'bounded-floor']`; `#btn-emu` "Am PC testen" → `app.enterEmu('desktop')`;
 `#status`; `#version`), loads `./src/app.js`. No external requests. `sw.js` is registered by the App as
-`./sw.js?v=<APP_VERSION>`; it precaches the shell (index, manifest, icons, three, all `src/` modules
-incl. other lanes' files — missing ones are skipped, `choreos/index.json` + the two procedural dances,
-`models/free/*.json`), caches `src/ vendor/ models/ choreos/ assets/` cache-first at runtime (the int8 models
-and the mocap dance on first use) and serves `/api/*` network-first with cache fallback; old
-`dp-shell-*` caches are deleted on activate; `postMessage({type:'clearCache'})` empties them. Icons:
+`./sw.js?v=<APP_VERSION>` (+ `registration.update()` at every boot; a `controllerchange` after an
+update reloads the page once it is back in the menu). Strategy (superseding the first version, see the
+fixer appendix): the **shell** (`index.html`, manifest, `src/`, `choreos/`, `assets/`, `models/*/*.json`)
+is served **network-first** with a conditional request (`cache: 'no-cache'`, ETag/304) and falls back to
+the cache `dp-shell-<SW_VERSION>` offline; it is precached on install (all `src/` modules, every entry of
+`choreos/index.json`). The big immutable **assets** (`vendor/`, `models/*.onnx`) are **cache-first** in the
+unversioned cache `dp-assets` (returned to the page immediately, stored via `event.waitUntil`; never deleted
+on activate, revalidated once by ETag after a version bump). `/api/*` is network-first with cache fallback
+(`/api/info`, `/api/health` never cached). `SW_VERSION` inside `sw.js` must equal `APP_VERSION`
+(`tests/unit/fixes.test.js`); old `dp-shell-*` caches are deleted on activate; `postMessage({type:'clearCache'})`
+empties both caches. A service worker only registers on a trusted‑certificate origin (see §1). Icons:
 `assets/icon.svg` (source) and `icon-192.png` / `icon-512.png` rendered from it with headless Chromium.
 
 Addendum (presentation): `app.setBodyAvatarPoseProvider(fn, skeleton?, { unscaled: true })` multiplies the
@@ -1180,8 +1187,8 @@ not installed). All duo modules are pure JS (no three.js/DOM), importable in Nod
 ### `server/server.js`
 
 `node server/server.js [--port 8443] [--http-port 8080] [--http|--no-http] [--no-https]
-[--host 0.0.0.0] [--dir ../webxr] [--data server/data] [--cert x.pem --key y.pem] [--no-coep]
-[--verbose] [--quiet]`. Defaults: HTTPS **and** HTTP listeners on; `--http` only forces the HTTP
+[--host 0.0.0.0] [--dir ../webxr] [--data server/data] [--cert x.pem --key y.pem] [--token secret]
+[--no-coep] [--verbose] [--quiet]`. Defaults: HTTPS **and** HTTP listeners on; `--http` only forces the HTTP
 listener on, `--no-https` drops the HTTPS listener (no certificate needed – use it in tests/CI,
 e.g. `--http --http-port 8090 --no-https`, otherwise a first start also generates a certificate
 and binds 8443). `--http-port 0` picks a free port. After start‑up stdout carries one
@@ -1198,13 +1205,21 @@ MAX_RESULTS=5000, MAX_BODY_CHOREO=5 MB, MAX_BODY_DEFAULT=1 MB`.
 Static: `--dir` root, directory → `index.html` (301 to the trailing slash), MIME per extension
 (`.js/.mjs` `text/javascript`, `.wasm` `application/wasm`, `.onnx/.bin` `application/octet-stream`,
 `.json` `application/json`, `.webmanifest` `application/manifest+json`, audio/image/font types),
-`Cache-Control: no-cache` for `.html/.json/.webmanifest` and `sw.js`, `public, max-age=3600`
-otherwise, weak ETag + `If-None-Match` → 304, `Range` → 206, HEAD, path traversal blocked.
-Every response carries `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy:
-require-corp` (unless `--no-coep`), `Cross-Origin-Resource-Policy: cross-origin`,
-`X-Content-Type-Options: nosniff`; `/api/*` additionally `Access-Control-Allow-Origin: *` (+
-OPTIONS preflight), so the app may also be served from GitHub Pages and talk to a LAN server via
-`?server=`.
+`Cache-Control: no-cache` for `.html/.json/.webmanifest`, `sw.js` and everything under `src/` and
+`choreos/` (ETag revalidation: a fix reaches the headsets at the next load), `public, max-age=3600`
+otherwise (vendor, models), weak ETag + `If-None-Match` → 304, `Range` → 206, HEAD, path traversal
+blocked. Every response carries `Cross-Origin-Opener-Policy: same-origin`,
+`Cross-Origin-Embedder-Policy: require-corp` (unless `--no-coep`), `Cross-Origin-Resource-Policy:
+cross-origin`, `Access-Control-Allow-Origin: *` (static files too: a Pages‑hosted app loads choreo
+JSON/audio with `fetch()`), `X-Content-Type-Options: nosniff`; `/api/*` additionally the CORS
+method/header allowances (+ OPTIONS preflight, `X-Dp-Token` allowed), so the app may also be served
+from GitHub Pages and talk to a LAN server via `?server=`.
+
+**Write access** (`_authorize`): with `--token <secret>` every `POST`/`DELETE` under `/api/` must carry
+`X-Dp-Token: <secret>` (or `?token=`), otherwise 401; without a token `POST` is open (headsets upload
+results/runs/recordings) and `DELETE` is only accepted from the loopback interface (403 otherwise).
+The app takes the token once from `?token=` (`config.parseParams`), persists it in `dp.settings.apiToken`
+and sends the header on every upload. `GET /api/info` reports `auth: 'token' | 'none'`.
 
 REST (JSON; errors are `{error, errors?}` with 400/404/405/413/500):
 
@@ -1217,7 +1232,7 @@ REST (JSON; errors are `{error, errors?}` with 400/404/405/413/500):
 | `POST /api/choreos` | body ≤ 5 MB, `validateChoreo` from `webxr/src/game/choreo.js` (structural fallback when the app tree is absent) → `data/choreos/<id>.json`; 201 `{ok, id, url, entry}` / 400 `{error, errors[]}` |
 | `DELETE /api/choreos/:id` | removes an upload (404 for shipped ids) |
 | `GET /api/results?choreoId=&player=&limit=100` | `{results:[…]}` newest first |
-| `POST /api/results` | ≤ 1 MB; `validateResult` (`choreoId` id‑pattern, `score` 0..100, optional `stars 0..5, maxCombo ≥ 0, timingBias, player, mode, playedAt ISO, moves ≤ 256, perBeat ≤ 8192`); adds `id, receivedAt` (+ `playedAt` if missing); stored in `data/results.json` (debounced atomic write, ≤ 5000 kept); 201 `{ok, id, result}` |
+| `POST /api/results` | ≤ 1 MB; `validateResult` (`choreoId` id‑pattern, `score` 0..100, optional `stars 0..5, maxCombo ≥ 0, timingBias, player, mode, playedAt ISO, moves ≤ 256, perBeat ≤ 8192`); **`sanitizeResult`** keeps only the known fields (`choreoId, score, stars, maxCombo, timingBias, durationSec, ticks, meanFrameScore, mirror, player ≤ 64, mode, playedAt, choreoTitle ≤ 200, moves ≤ 256 × {name, score, grade, startBeat, endBeat, ticks, gated}, perBeat ≤ 8192 numbers, benchmark {mode, winner, pair (numbers), partner {name, score, stars, maxCombo}} ≤ 8 KB`); adds `id, receivedAt` (+ `playedAt` if missing); stored in `data/results.json` (debounced atomic write, ≤ 5000 kept); 201 `{ok, id, result}`. An over‑limit body gets a real 413 (chunked uploads are drained, not reset). |
 | `GET /api/runs?choreoId=&limit=100` | `{runs:[meta]}` newest first, **metadata only** `{id, choreoId, player, score, mode, playedAt, receivedAt, fps, frameCount, url:'/api/runs/<id>'}` |
 | `GET /api/runs/:id` | the full run JSON as uploaded (+ `id, receivedAt`) |
 | `POST /api/runs` | ≤ 5 MB; `validateRun` accepts `dancing-points-run/1` (`head[][7]/left[][3]/right[][3]`) or the compact `{frames:[[hx,hy,hz,lx,ly,lz,rx,ry,rz]]}` layout, `fps` in (0,240], 1..20000 frames; stored as `data/runs/<choreoId>/<id>.json`; **cap 50 per choreography** (oldest by `receivedAt` deleted, ids returned in `removed[]`); 201 `{ok, id, url, run: meta, removed}` |
@@ -1486,3 +1501,92 @@ Addendum (integration): the teacher's representation is no longer coupled to the
 how the *player* is shown (neural body, three points, or no mirror). Reason: the shipped dances
 now all have a body, the body is one instanced draw call, and the emu default of `'points'`
 would otherwise hide the teacher's body on the desktop.
+
+## Appendix: fixer (review findings applied)
+
+Lane *fixer*: the reviewers' findings were applied across the presentation, duo, net, server and
+docs lanes; this appendix lists the interface changes (everything else in the appendices above
+still holds). Regression tests: `tests/unit/fixes.test.js`, the `hardening` test in
+`tests/unit/server.test.js`; the e2e suite is unchanged and green.
+
+### Versions and the service worker
+
+* `APP_VERSION` (`src/config.js`) and `SW_VERSION` (`sw.js`) and `SERVER_VERSION` are `0.1.1` and
+  **must be bumped together** (`fixes.test.js` compares them). `sw.js` is now network‑first for the
+  shell (conditional requests, offline fallback) and cache‑first only for `vendor/` and
+  `models/*.onnx` in the unversioned `dp-assets` cache (see the presentation appendix). The App
+  calls `registration.update()` at boot and reloads once after a `controllerchange` when it is in
+  the menu (`app._swReload` defers it during a run). A failed registration (self‑signed
+  certificate: Chromium refuses the script) is shown on the start overlay (`app.swError`,
+  German notice `swFailed`) instead of only `console.warn`.
+* `server.js`: `src/` and `choreos/` are `no-cache`; `Access-Control-Allow-Origin: *` on all
+  responses; `--token`; `sanitizeResult` (exported); 413 for over‑limit chunked bodies;
+  `GET /api/info.auth`.
+
+### App (`src/app.js`)
+
+* Boot: `_probeXR()` runs before the network probes (the VR button never waits for a server);
+  `_fetch(url, init, ms = FLOW.networkTimeoutMs)` wraps every REST call with
+  `AbortSignal.timeout`; `loadChoreoList()` publishes shipped + own entries first (`_publishChoreos`)
+  and merges the server list when it arrives; `loadChoreoRef(id)` falls back to
+  `${serverHttp}/api/choreos/<id>` for an id that is not in the list (a partner's upload).
+  `openDuoLobby()` refreshes the list in the background.
+* Calibration: `_calibrationStillValid()` additionally requires the head yaw within ~30°
+  (`CALIBRATION_MAX_YAW_DIFF`) of the stored yaw; a released trigger cancels the partial capture
+  (`Calibration.cancelCapture()`, new; `captureCount` getter) instead of installing it; a reused
+  calibration waits `FLOW.calibrationReuseWaitSec` (2 s, progress bar + "Bereit?" notice) before
+  the count‑in, and a trigger hold during that wait recalibrates. In XR the trigger activates the
+  calibrate panel's buttons when the laser hovers one (`menu.hovering`), otherwise it is the hold.
+* Quitting in XR: `_updateQuitHold(time)` runs in `_frame` for CALIBRATE, COUNTDOWN, PLAYING and
+  RECORDING: hold B/Y for `FLOW.quitHoldSec` (2.5 s) with a countdown notice; release resets.
+* Recentre / visibility / GPU: `sceneKit.onReferenceSpaceReset` → `_onRecenter()` (clears the
+  calibration, resets the stage, aborts a run, notice `recentered`, event `'recenter'`);
+  `sceneKit.onVisibilityChange` → `_onXRVisibility(state)` pauses/resumes the `PlaySession`
+  (+ `AudioEngine.pauseTrack()/resumeTrack()`, new) while the system menu is open / the headset
+  is off; `onContextRestored` → `_reload()`.
+* Results: `startSolo` resets `app.lastBenchmark`; `_storeResult` uploads immediately except for
+  the online duo, where the POST waits (≤ `RESULT_POST_DELAY_MS` = 10 s) for the benchmark;
+  **`app.attachBenchmark(benchmark, result?)`** (new, called by the online mode) updates the stored
+  local copy and releases the pending upload. `highscores()` de‑duplicates local + server copies
+  (`mergeResults`; only server‑only entries carry `fromServer`); `_fetchServerHighscores` asks
+  for `limit=1000`. Uploads send `X-Dp-Token` when `settings.apiToken` is set (`?token=` once).
+* Neural avatar: progress notices while the models download (`neuralProgress`); a guard verdict
+  is persisted in `settings.neuralVerdict = {disabled, reason, inferenceMs, at, version}` and
+  `_neuralEnsure()` skips the driver on later boots until "Neural" is chosen in the settings
+  again (or `?avatar=neural`); `_frame` feeds `driver.reportFrameMs(dt·1000)` while presenting.
+* `Menu`: `visible` is `false` after `hideAll()` (no laser during a dance) and `true` after
+  `show()/showAlso()`; `press()` ignores presses within `pressLockMs` (250 ms) of `show()`;
+  `hovering` getter. HUD/menu textures use mipmaps; the notice panel sits at `NOTICE_Y = 0.95` m.
+
+### Input, driver, duo
+
+* `XRInput`: `isPressed('trigger'|'squeeze')` uses the gamepad's digital `pressed` flag when
+  reported, otherwise a Schmitt trigger (`PRESS_ON = 0.6`, `PRESS_OFF = 0.4`); button state
+  gains `triggerDown, squeezeDown, triggerPressed, squeezePressed`.
+* `NeuralAvatarDriver`: `defaultThreads(nav?, isolated?)` and `isMobileXR(nav?)` are exported;
+  the count is capped at `MOBILE_MAX_THREADS = 2` on mobile user agents or ≤ 8 cores.
+  `reportFrameMs(ms)` (render‑loop guard: median frame time per `guard.frameWindow` = 90 frames,
+  > `frameSlowMs` 15 → 15 Hz, > `frameDisableMs` 22 twice or while already slow → disabled);
+  `stats.frameMs`, `stats.frameSlowWindows`.
+* `OnlineDuo._pushRemote` rejects states with non‑finite numbers and clamps `score` to 0..100,
+  `combo` to 0..1e6.
+* Online mode (`src/duo/modes.js`): the partner is recorded at the sample's own time
+  (`r.t`, i.e. `t − interpolationDelaySec`), so `syncLag`/`syncDistance` no longer include the
+  100 ms render delay; `startInfo` survives `exit()` (rematch from the results screen keeps the
+  synchronised start; `startOptions` ignores a broadcast older than `START_INFO_MAX_AGE_MS`);
+  `partnerGone` (`'left' | 'disconnected' | 'timeout' | 'abort'`) finishes the round without the
+  partner (`RESULT_TIMEOUT_MS` = 10 s after the own result, `peer left`, `disconnected`, or a
+  relayed `{type:'abort', reason}` which a guest sends when it cannot start the dance); the
+  partner avatar is hidden when `age > PARTNER_STALE_SEC` (2 s); `reconnect()` + a "Neu verbinden"
+  button in the lobby (one automatic retry after `RECONNECT_DELAY_MS` while in DUO_LOBBY);
+  `ensureConnected()` disposes a dead client before creating a new one; an unknown `choreoId`
+  in `start`/`choreo` triggers `app.loadChoreoList()` first. New texts: `duoReconnect,
+  duoPartnerGone, duoPartnerAborted, duoPartnerStartFailed`.
+
+### Documentation and deployment
+
+* DESIGN §1: no USB‑stick/`file://` mode; offline start / model cache / PWA need a trusted
+  certificate (`server/README.md` describes Let's Encrypt DNS‑01 and a private CA).
+* Root `package.json` `engines.node >= 20` (playwright‑core); the server alone runs on 18.
+* `.github/workflows/pages.yml`: `configure-pages` with `enablement: true` + a comment on the
+  one‑time Pages source setting.

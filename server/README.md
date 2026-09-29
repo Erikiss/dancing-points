@@ -3,7 +3,8 @@
 Kleiner Node-Server für den Betrieb im WLAN (z. B. VR-Arcade): liefert die WebXR-App per HTTPS
 an die Quest, speichert hochgeladene Tänze, Ergebnisse und Aufzeichnungen und vermittelt den
 Duo-Modus zwischen zwei Brillen (WebSocket-Relay). Ohne Server läuft die App auch von GitHub
-Pages / einem USB-Stick – der Server wird nur für eigene Tänze, Bestenliste und Online-Duo gebraucht.
+Pages (die App braucht immer einen HTTP(S)-Ursprung – von einem USB-Stick / `file://` startet
+sie nicht) – der Server wird für eigene Tänze, Bestenliste und Online-Duo gebraucht.
 
 ## Schnellstart
 
@@ -37,9 +38,35 @@ Alternativ aus dem Repository-Wurzelverzeichnis: `node server/server.js` oder `n
    und dann **„Weiter zu 192.168.… (unsicher)“ / „Proceed to … (unsafe)“**. Das Zertifikat ist selbst
    erstellt und enthält die LAN-IP als SAN; die Warnung kommt nur, weil es von keiner Zertifizierungs-
    stelle unterschrieben ist. Der Browser merkt sich die Ausnahme, bis sich die IP ändert.
-4. „VR starten“ tippen. Beim ersten Laden werden die Netzmodelle (~90 MB) geholt; danach sind sie
-   im Service-Worker-Cache und der Start geht schnell.
-5. Optional als App installieren: Browser-Menü → „Zum Startbildschirm hinzufügen“ (PWA).
+4. „VR starten“ tippen. Beim ersten Laden werden die Netzmodelle (~85 MB) geholt (die Brille
+   zeigt den Fortschritt als Hinweis an der Bühnenwand). Sie bleiben im normalen Browser-Cache
+   (`max-age` + ETag), solange der Browser ihn nicht wegräumt.
+5. **Selbstsigniertes Zertifikat = kein Service Worker.** Chromium (und damit der Quest-Browser)
+   registriert auf einer Adresse, deren Zertifikatswarnung weggeklickt wurde, keinen Service
+   Worker (`SecurityError: An SSL certificate error occurred when fetching the script`). Die App
+   läuft trotzdem, aber **ohne Offline-Start, ohne Modell-Cache im Service Worker und ohne
+   PWA-Installation** („Zum Startbildschirm hinzufügen“). Der Startbildschirm zeigt dann
+   „Kein Offline-Cache (Zertifikat nicht vertrauenswürdig)“. Wer das braucht, gibt dem Server ein
+   vertrauenswürdiges Zertifikat (`--cert/--key`, siehe unten) – dann gilt: Modelle nach dem
+   ersten Laden im Service-Worker-Cache, Start ohne Netz, PWA installierbar.
+
+## Vertrauenswürdiges Zertifikat (optional, für Offline-Cache und PWA)
+
+`node server.js --cert fullchain.pem --key privkey.pem` nimmt ein eigenes Zertifikat (PEM).
+Zwei gangbare Wege für einen Server, der nur im LAN erreichbar ist:
+
+* **Let's Encrypt mit DNS-01:** eine eigene Domain (z. B. `vr.example.de`), deren A-Record auf
+  die **LAN-IP** des Server-PCs zeigt (das ist erlaubt), und ein Zertifikat per DNS-Challenge
+  (`certbot certonly --manual --preferred-challenges dns -d vr.example.de` oder `acme.sh` mit
+  der DNS-API des Anbieters). Die Brillen öffnen dann `https://vr.example.de:8443/` ohne Warnung.
+  Alle 60–90 Tage erneuern (Skript/Cron) und den Server neu starten.
+* **Eigene CA:** mit `mkcert` (oder openssl) eine private CA anlegen, deren Root-Zertifikat auf
+  jeder Brille installieren (Einstellungen → Sicherheit → Zertifikat installieren; auf der Quest
+  über die Android-Einstellungen bzw. per MDM) und damit ein Server-Zertifikat für die LAN-IP
+  ausstellen.
+
+Mit dem selbstsignierten Zertifikat des Servers funktioniert alles außer Service Worker/PWA; für
+einen Arcade-Betrieb, bei dem der Server-PC immer läuft, reicht das.
 
 Tipp: Dem Server-PC im Router eine feste IP (DHCP-Reservierung) geben, sonst ändert sich die
 Adresse und die Zertifikatsausnahme muss neu bestätigt werden (der Server erzeugt bei neuer IP
@@ -57,8 +84,14 @@ Firewall des Server-PCs freigeben, sonst kommt die Quest nicht durch:
 * Linux (ufw): `sudo ufw allow 8443/tcp && sudo ufw allow 8080/tcp`
 * macOS: Systemeinstellungen → Netzwerk → Firewall → Node erlauben.
 
-Es gibt **keine Authentifizierung** – der Server ist nur für ein vertrauenswürdiges LAN gedacht, nicht
-für das offene Internet.
+Der Server ist für ein **vertrauenswürdiges LAN** gedacht, nicht für das offene Internet. Ohne
+weitere Optionen darf jeder im WLAN lesen und hochladen (Ergebnisse, Aufzeichnungen, Tänze – ein
+Upload mit der id eines mitgelieferten Tanzes ersetzt diesen), Löschen (`DELETE`) geht nur von
+`localhost`. In einem Gäste-WLAN (Kunden-Handys im selben Netz) den Server mit **`--token <geheim>`**
+starten: dann brauchen alle schreibenden Aufrufe (`POST`/`DELETE`) den Header `X-Dp-Token`
+(oder `?token=` in der URL). Die Brillen bekommen den Token einmalig mit, indem man die App als
+`https://<ip>:8443/?token=<geheim>` öffnet – er wird in den Einstellungen der Brille gespeichert
+und bei jedem Upload mitgeschickt. Zusätzlich empfiehlt sich ein eigenes WLAN/VLAN für die Brillen.
 
 ## Optionen
 
@@ -77,7 +110,8 @@ node server.js [--port 8443] [--http-port 8080] [--http] [--no-http] [--no-https
 | `--host` | Bind-Adresse (Standard: alle Interfaces) |
 | `--dir` | Verzeichnis der Web-App (Standard: `../webxr` neben `server.js`) |
 | `--data` | Datenverzeichnis (Standard: `server/data`) – Zertifikat, Uploads, Ergebnisse, Aufzeichnungen |
-| `--cert`, `--key` | eigenes Zertifikat (PEM) statt des selbstsignierten |
+| `--cert`, `--key` | eigenes Zertifikat (PEM) statt des selbstsignierten (nötig für Service Worker / PWA, s. o.) |
+| `--token` | Geheimnis für schreibende API-Aufrufe (`X-Dp-Token` / `?token=`); ohne Token: Löschen nur von localhost |
 | `--no-coep` | die Cross-Origin-Isolation-Header (COOP/COEP) weglassen, falls externe Audio-URLs ohne CORS geladen werden sollen |
 | `--verbose` / `--quiet` | jede Anfrage loggen / nur Fehler |
 
@@ -90,9 +124,12 @@ stdout (für Skripte/Tests). `Ctrl+C` beendet ihn sauber.
   `.wasm` → `application/wasm`, `.onnx` → `application/octet-stream`, `.webmanifest`), `Cache-Control:
   no-cache` für HTML/JSON/`sw.js`, ETag/304, Range-Requests (Audio), und die Header
   `Cross-Origin-Opener-Policy: same-origin` / `Cross-Origin-Embedder-Policy: require-corp`
-  (schaltet `SharedArrayBuffer` frei, damit onnxruntime-web später mit Threads laufen kann).
-  Gleiche-Origin-Dateien laden damit uneingeschränkt; fremde Origins müssen CORS/CORP liefern
-  (Ausweg: `--no-coep`).
+  (schaltet `SharedArrayBuffer` frei, damit onnxruntime-web mit Threads laufen kann; auf der
+  Quest 2 nutzt die App höchstens 2 Threads) sowie `Access-Control-Allow-Origin: *` auf allen
+  Antworten, damit auch eine von GitHub Pages geladene App (`?server=`) Tanzdateien und Musik von
+  hier holen kann. `src/` und `choreos/` werden mit `no-cache` (ETag/304) ausgeliefert, damit
+  Änderungen sofort auf den Brillen ankommen; fremde Origins müssen CORS/CORP liefern (Ausweg:
+  `--no-coep`).
 * **REST-API** (JSON, CORS offen):
   * `GET /api/info` – Version, URLs, `https`-Flag, Limits
   * `GET /api/choreos` – Index der mitgelieferten Tänze (`webxr/choreos/index.json`) zusammengeführt
@@ -100,8 +137,9 @@ stdout (für Skripte/Tests). `Ctrl+C` beendet ihn sauber.
     ersetzt den mitgelieferten Eintrag (`replaces: "shipped"`)
   * `GET /api/choreos/:id`, `POST /api/choreos` (Body ≤ 5 MB, wird validiert, landet in
     `data/choreos/<id>.json`), `DELETE /api/choreos/:id` (nur Uploads)
-  * `GET /api/results?choreoId=&player=&limit=` (neueste zuerst), `POST /api/results` (≤ 1 MB;
-    `data/results.json`, max. 5000 Einträge)
+  * `GET /api/results?choreoId=&player=&limit=` (neueste zuerst, `limit` bis 1000), `POST /api/results`
+    (≤ 1 MB; nur die bekannten Felder werden gespeichert, `moves` ≤ 256, `perBeat` ≤ 8192,
+    `benchmark` ≤ 8 KB; `data/results.json`, max. 5000 Einträge)
   * `GET /api/runs?choreoId=&limit=` (nur Metadaten), `GET /api/runs/:id` (komplette Aufzeichnung),
     `POST /api/runs` (≤ 5 MB; `data/runs/<choreoId>/<id>.json`, **max. 50 pro Tanz**, älteste fliegen
     raus), `DELETE /api/runs/:id`
@@ -120,6 +158,7 @@ erscheinen sofort bei allen Brillen im Menü unter „Eigene Tänze“. Manuell:
 
 ```bash
 curl -k -X POST -H "Content-Type: application/json" --data-binary @mein-tanz.json https://localhost:8443/api/choreos
+# mit --token: zusätzlich -H "X-Dp-Token: <geheim>"
 ```
 
 Musikdateien (`audio.url` in der Choreo) am einfachsten nach `webxr/choreos/` legen und relativ

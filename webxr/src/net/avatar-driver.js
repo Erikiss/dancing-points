@@ -36,16 +36,40 @@ const DEFAULT_GUARD = Object.freeze({
   disableMs: 60,     // > disableMs -> disable the neural avatar
   minTicks: 10,      // evaluate the guard only after this many inferences
   recoverRatio: 0.7, // back to 30 Hz when the average drops below slowMs * recoverRatio
+  // render-loop guard (`reportFrameMs`, fed by the App only while presenting in XR): the WASM
+  // threads compete with the main thread + compositor; a starved render loop (judder) is what
+  // the player notices, not the worker's own timing
+  frameWindow: 90,   // frames per evaluation window (~1.25 s at 72 Hz)
+  frameSlowMs: 15,   // median frame time above this -> 15 Hz
+  frameDisableMs: 22, // ... above this (~45 fps on a 72 Hz headset) -> disabled
 });
+
+export const MOBILE_MAX_THREADS = 2;   // Quest 2: 4 busy int8 threads starve the render loop
+
+/** True on the Quest / other Android headsets and phones (thread budget is tight there). */
+export function isMobileXR(nav = (typeof navigator !== 'undefined' ? navigator : null)) {
+  if (!nav) return false;
+  const ua = nav.userAgent || '';
+  if (/OculusBrowser|Quest|Pico|Android|Mobile/i.test(ua)) return true;
+  return false;
+}
 
 function defaultNow() {
   return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 }
 
-function defaultThreads() {
-  if (typeof crossOriginIsolated === 'undefined' || !crossOriginIsolated) return 1;
-  const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 2;
-  return Math.max(1, Math.min(4, cores - 1));
+/**
+ * Worker thread count: 1 without cross-origin isolation (no SharedArrayBuffer); otherwise
+ * min(4, cores - 1), capped at MOBILE_MAX_THREADS on mobile headsets or when the machine has
+ * <= 8 logical cores (the Quest 2 reports 8: 4 busy matmul threads next to the render thread
+ * and the XR compositor push it below 72 Hz).
+ */
+export function defaultThreads(nav = (typeof navigator !== 'undefined' ? navigator : null), isolated = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated)) {
+  if (!isolated) return 1;
+  const cores = (nav && nav.hardwareConcurrency) || 2;
+  let n = Math.max(1, Math.min(4, cores - 1));
+  if (isMobileXR(nav) || cores <= 8) n = Math.min(n, MOBILE_MAX_THREADS);
+  return n;
 }
 
 function resolveUrl(rel) {
@@ -129,7 +153,13 @@ export class NeuralAvatarDriver {
     this.msCount = 0;
     this.msIndex = 0;
     this.inferenceMs = 0;
-    this.stats = { frames: 0, poses: 0, dropped: 0, meanMs: 0, maxMs: 0, minMs: Infinity, disabledAt: 0 };
+    this.stats = { frames: 0, poses: 0, dropped: 0, meanMs: 0, maxMs: 0, minMs: Infinity, disabledAt: 0, frameMs: 0, frameSlowWindows: 0 };
+    // render-loop guard
+    this.frameRing = new Float32Array(Math.max(8, this.guard.frameWindow | 0));
+    this.frameSorted = new Float32Array(this.frameRing.length);
+    this.frameCount = 0;
+    this.frameMedianMs = 0;
+    this.frameSlowWindows = 0;
 
     this._pendingTelemetry = [];
     this._readyResolve = null;
@@ -465,6 +495,50 @@ export class NeuralAvatarDriver {
       this._post({ type: 'config', inferEvery: 1 });
       this._setState('running', '');
     }
+  }
+
+  /**
+   * Render-loop guard: feed the render frame interval (ms) every frame while the headset is
+   * presenting. Evaluated per window of `guard.frameWindow` frames: a median above
+   * `frameSlowMs` switches to 15 Hz, two consecutive windows above `frameDisableMs` (or one
+   * while already at 15 Hz) disable the neural avatar. Returns the current median (0 until the
+   * first window is complete). No allocation per call.
+   */
+  reportFrameMs(ms) {
+    if (!this.active || !(ms > 0) || ms > 1000) return this.frameMedianMs;
+    const ring = this.frameRing;
+    ring[this.frameCount % ring.length] = ms;
+    this.frameCount++;
+    if (this.frameCount % ring.length !== 0) return this.frameMedianMs;
+    // window complete: median (insertion sort into the scratch array, 90 values)
+    const s = this.frameSorted;
+    s.set(ring);
+    for (let i = 1; i < s.length; i++) {
+      const v = s[i];
+      let j = i - 1;
+      while (j >= 0 && s[j] > v) { s[j + 1] = s[j]; j--; }
+      s[j + 1] = v;
+    }
+    const median = s[s.length >> 1];
+    this.frameMedianMs = median;
+    this.stats.frameMs = median;
+    if (median > this.guard.frameDisableMs) {
+      this.frameSlowWindows++;
+      this.stats.frameSlowWindows = this.frameSlowWindows;
+      if (this.frameSlowWindows >= 2 || this.inferEvery === 2) {
+        this.stats.disabledAt = this.inferenceMs;
+        this._disable();
+        return median;
+      }
+    } else {
+      this.frameSlowWindows = 0;
+    }
+    if (median > this.guard.frameSlowMs && this.inferEvery === 1) {
+      this.inferEvery = 2;
+      this._post({ type: 'config', inferEvery: 2 });
+      this._setState('slow', NOTICES.slow);
+    }
+    return median;
   }
 
   _disable() {

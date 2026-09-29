@@ -181,8 +181,13 @@ test('static files: MIME types, isolation headers, caching, 404, traversal, rang
   }
   const json = await fetch(`${base}/choreos/index.json`);
   assert.equal(json.headers.get('cache-control'), 'no-cache');
+  // app modules and dances are always revalidated (a fix must reach the headsets); the big
+  // immutable vendor/model files may be cached for an hour (ETag/304 afterwards)
   const js = await fetch(`${base}/src/config.js`);
-  assert.match(js.headers.get('cache-control'), /max-age/);
+  assert.equal(js.headers.get('cache-control'), 'no-cache');
+  assert.equal(js.headers.get('access-control-allow-origin'), '*', 'static files are fetchable from a Pages-hosted app');
+  const vendor = await fetch(`${base}/vendor/three.module.js`, { method: 'HEAD' });
+  assert.match(vendor.headers.get('cache-control'), /max-age/);
   const missing = await fetch(`${base}/does-not-exist.js`);
   assert.equal(missing.status, 404);
   for (const bad of ['/%2e%2e/%2e%2e/etc/passwd', '/src/%2e%2e/%2e%2e/%2e%2e/etc/passwd', '/..%2f..%2fetc/passwd']) {
@@ -627,4 +632,50 @@ test('OnlineDuo client end to end: rooms, clock sync, start, state interpolation
   assert.equal(lonely.state, 'closed');
   const noImpl = new OnlineDuo({ WebSocketImpl: null });
   if (!globalThis.WebSocket) await assert.rejects(noImpl.connect('ws://x'), /not available/);
+});
+
+test('hardening: DELETE off the LAN without a token, sanitized results, 413 for over-limit chunked bodies', { skip }, async () => {
+  // results keep only the known fields (a client cannot pin arbitrary JSON in results.json)
+  const junk = await api('POST', '/api/results', { choreoId: 'snoop-cwalk', score: 50, player: 'x'.repeat(500), junk: { deep: 'y'.repeat(1000) }, benchmark: 'not-an-object', moves: [{ name: 'A', score: 0.5, grade: 'ok', extra: 1 }], perBeat: [0.1, 'x'] });
+  assert.equal(junk.status, 201, junk.text);
+  assert.equal(junk.json.result.junk, undefined);
+  assert.equal(junk.json.result.benchmark, undefined);
+  assert.equal(junk.json.result.player.length, 64);
+  assert.deepEqual(junk.json.result.moves, [{ name: 'A', score: 0.5, grade: 'ok' }]);
+  assert.deepEqual(junk.json.result.perBeat, [0.1, 0]);
+  const withBench = await api('POST', '/api/results', { choreoId: 'snoop-cwalk', score: 60, mode: 'ghost', benchmark: { mode: 'ghost', winner: 'A', pair: { syncDistance: 0.01, syncLag: 0.002, junk: 'no' }, partner: { name: 'Geist', score: 55, stars: 3, maxCombo: 4, junk: 1 } } });
+  assert.equal(withBench.status, 201, withBench.text);
+  assert.deepEqual(withBench.json.result.benchmark, { mode: 'ghost', winner: 'A', pair: { syncDistance: 0.01, syncLag: 0.002 }, partner: { name: 'Geist', score: 55, stars: 3, maxCombo: 4 } });
+  // over-limit chunked upload (no Content-Length): a real 413, not a connection reset
+  const chunked = await fetch(`${base}/api/results`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: new ReadableStream({ start(c) { const chunk = new Uint8Array(64 * 1024).fill(120); for (let i = 0; i < 40; i++) c.enqueue(chunk); c.close(); } }),
+    duplex: 'half',
+  });
+  assert.equal(chunked.status, 413);
+  assert.match((await chunked.json()).error, /too large/);
+  // the server is still healthy afterwards
+  assert.equal((await api('GET', '/api/health')).status, 200);
+  // DELETE from loopback is allowed without a token (this test); the authorization helper
+  // rejects other addresses
+  const { DancingPointsServer, parseArgs } = await import('../../server/server.js');
+  const srv = new DancingPointsServer(parseArgs(['--no-https', '--http-port', '0']));
+  const fakeReq = (remote, headers = {}) => ({ headers, socket: { remoteAddress: remote } });
+  const u = new URL('http://x/api/runs/abc');
+  assert.equal(srv._authorize(fakeReq('127.0.0.1'), u, 'DELETE'), null);
+  assert.equal(srv._authorize(fakeReq('::1'), u, 'DELETE'), null);
+  assert.equal(srv._authorize(fakeReq('192.168.1.7'), u, 'DELETE').status, 403);
+  assert.equal(srv._authorize(fakeReq('192.168.1.7'), u, 'POST'), null, 'headsets may upload without a token');
+  assert.equal(srv._authorize(fakeReq('192.168.1.7'), u, 'GET'), null);
+  // with --token every mutating call needs the header (or ?token=)
+  const tok = new DancingPointsServer(parseArgs(['--no-https', '--http-port', '0', '--token', 'geheim-123']));
+  assert.equal(tok._authorize(fakeReq('192.168.1.7'), u, 'POST').status, 401);
+  assert.equal(tok._authorize(fakeReq('127.0.0.1'), u, 'DELETE').status, 401);
+  assert.equal(tok._authorize(fakeReq('192.168.1.7', { 'x-dp-token': 'geheim-123' }), u, 'POST'), null);
+  assert.equal(tok._authorize(fakeReq('192.168.1.7', { 'x-dp-token': 'falsch' }), u, 'POST').status, 401);
+  assert.equal(tok._authorize(fakeReq('192.168.1.7'), new URL('http://x/api/results?token=geheim-123'), 'POST'), null);
+  assert.equal(tok._authorize(fakeReq('192.168.1.7'), u, 'GET'), null, 'reads stay open');
+  assert.throws(() => parseArgs(['--token', 'ab']), /token/);
+  assert.equal((await api('GET', '/api/info')).json.auth, 'none');
 });

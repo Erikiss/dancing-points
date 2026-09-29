@@ -34,7 +34,7 @@ test('parseParams defaults and parsing', () => {
   assert.equal(bad.avatar, 'neural');
   assert.equal(bad.lang, 'de');
   assert.equal(bad.autostart, false);
-  assert.equal(APP_VERSION, '0.1.0');
+  assert.match(APP_VERSION, /^\d+\.\d+\.\d+$/);   // parity with sw.js: tests/unit/fixes.test.js
   assert.equal(SCORING.sigmaHead, 0.10);
   assert.equal(SCORING.sigmaHand, 0.18);
   assert.equal(SCORING.sigmaVel, 0.80);

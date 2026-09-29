@@ -101,8 +101,10 @@ export class MenuPanel {
     this.ctx = this.canvas.getContext('2d');
     this.texture = new THREE.CanvasTexture(this.canvas);
     this.texture.colorSpace = THREE.SRGBColorSpace;
-    this.texture.minFilter = THREE.LinearFilter;
-    this.texture.generateMipmaps = false;
+    // mipmaps: the panel is minified for players shorter than the reference height (stage scale)
+    // and at ~640 px/m on a Quest 2; without them text shimmers during head motion
+    this.texture.minFilter = THREE.LinearMipmapLinearFilter;
+    this.texture.generateMipmaps = true;
     this.texture.anisotropy = 4;
     this.material = new THREE.MeshBasicMaterial({ map: this.texture, transparent: true, depthWrite: false });
     this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(this.widthM, 0.1), this.material);
@@ -505,6 +507,9 @@ export class Menu extends THREE.Group {
     this.hoverHit = -1;
     this.hitPoint = new THREE.Vector3();
     this.hasHit = false;
+    this.pressLockMs = opts.pressLockMs >= 0 ? opts.pressLockMs : DEFAULT_PRESS_LOCK_MS;
+    this._shownAt = -Infinity;
+    this.visible = false;   // no panel shown yet (also gates the XR laser in the App loop)
 
     // laser + reticle live in world space (added to the scene by the app)
     const lgeo = new THREE.BufferGeometry();
@@ -576,6 +581,7 @@ export class Menu extends THREE.Group {
     if (p) { p.hover = -1; p.focus = -1; p.refresh(); }
     this._rebuildMeshList();
     this.visible = true;
+    this._shownAt = now();
   }
 
   /** Show a panel in addition to the active one. */
@@ -583,6 +589,7 @@ export class Menu extends THREE.Group {
     const p = this.panels.get(id);
     if (p) { this._setPanelVisible(p, true); p.refresh(); }
     this._rebuildMeshList();
+    this.visible = true;
   }
 
   hidePanel(id) {
@@ -599,6 +606,7 @@ export class Menu extends THREE.Group {
     this.reticle.visible = false;
     this.hoverPanel = null;
     this.hoverHit = -1;
+    this.visible = false;   // no laser / trigger handling while nothing is shown (during a dance)
   }
 
   _setPanelVisible(p, on) {
@@ -663,10 +671,17 @@ export class Menu extends THREE.Group {
     this._pointer.active = false;
   }
 
+  /** True while the reticle/mouse is over an interactive item of a visible panel. */
+  get hovering() {
+    return !!(this.hoverPanel && this.hoverPanel.visible && this.hoverHit >= 0);
+  }
+
   /** Activate the hovered item. Returns true when something was activated. */
   press() {
     const p = this.hoverPanel;
     if (!p || this.hoverHit < 0 || !p.visible) return false;
+    // a squeeze that outlasts the previous screen must not hit a freshly shown panel
+    if (now() - this._shownAt < this.pressLockMs) return false;
     const hit = p.hits[this.hoverHit];
     if (!hit) return false;
     p.setFocus(this.hoverHit);
@@ -798,3 +813,8 @@ export class Menu extends THREE.Group {
 }
 
 const _quat = new THREE.Quaternion();
+const DEFAULT_PRESS_LOCK_MS = 250;
+
+function now() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}

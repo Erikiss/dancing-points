@@ -21,6 +21,7 @@ export const HUD_COLORS = Object.freeze({
 });
 
 export const FONT = '"Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+export const NOTICE_Y = 0.95;   // height (m) of the notice panel on the stage wall
 
 /**
  * A plane with a canvas texture. `draw(fn, key)` runs `fn(ctx, w, h)` only when `key` differs
@@ -40,8 +41,10 @@ export class TextPanel extends THREE.Mesh {
     canvas.height = Math.max(8, Math.round(height * ppm));
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
-    texture.minFilter = THREE.LinearFilter;
-    texture.generateMipmaps = false;
+    // mipmaps: the stage is scaled by h0/1.70, so the panels are minified for most players and
+    // shimmer during head motion without them (NPOT mipmaps are fine on WebGL2 / Quest)
+    texture.minFilter = THREE.LinearMipmapLinearFilter;
+    texture.generateMipmaps = true;
     texture.anisotropy = 4;
     const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false });
     super(new THREE.PlaneGeometry(width, height), material);
@@ -212,9 +215,10 @@ export class HUD extends THREE.Group {
     this._gradeAge = 0;
     this._gradeLife = 0.9;
 
-    // notice (bottom, temporary)
+    // notice (temporary; at hip height of the teacher so it sits in the player's field of view -
+    // at floor level it was ~24 degrees below the eye line and easy to miss)
     this.noticePanel = new TextPanel({ width: 3.0, height: 0.3, name: 'hud-notice', background: 'rgba(60, 20, 30, 0.85)' });
-    this.noticePanel.position.set(0, 0.2, zf + 0.01);
+    this.noticePanel.position.set(0, NOTICE_Y, zf + 0.01);
     this.noticePanel.visible = false;
     this.add(this.noticePanel);
     this._noticeLeft = 0;
