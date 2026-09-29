@@ -113,6 +113,16 @@ export class Calibration {
     return a.n;
   }
 
+  /** Drop an averaged capture without installing anything (short trigger tap, cancel). */
+  cancelCapture() {
+    this._acc = null;
+  }
+
+  /** Number of samples accepted by the running averaged capture (0 when none is running). */
+  get captureCount() {
+    return this._acc ? this._acc.n : 0;
+  }
+
   /** Finish the averaged capture; installs and returns the data (null if nothing accepted). */
   endCapture() {
     const a = this._acc;

@@ -22,6 +22,10 @@ import { buildBenchmark, toCSV, toJSON } from './benchmark.js';
 
 export const START_DELAY_MS = 8000;            // host start -> count-in (time for both calibrations)
 export const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';   // the server's code alphabet (no I/O)
+export const RESULT_TIMEOUT_MS = 10000;        // wait this long for the partner's result, then finish without it
+export const PARTNER_STALE_SEC = 2.0;          // hide the partner avatar when no state arrived for this long
+export const START_INFO_MAX_AGE_MS = 60000;    // a server `start` older than this is not reused for a new run
+export const RECONNECT_DELAY_MS = 3000;        // automatic reconnect attempt while in the lobby
 const DUO_PANEL = { width: 1.0, height: 0.4, position: [1.6, 1.84, 0.02] };
 
 // ---------------------------------------------------------------------------------------------
@@ -70,10 +74,11 @@ function safeName(s) {
 function benchmarkLines(app, mode, getBenchmark, nameB, waitingText) {
   const t = app.texts;
   const pct = (x) => `${Math.round(x)}`;
+  const waiting = () => (typeof waitingText === 'function' ? waitingText() : waitingText);
   const lines = [
     () => {
       const b = getBenchmark();
-      if (!b) return waitingText;
+      if (!b) return waiting();
       const B = b.players[1];
       return `${nameB()}: ${B.score === null ? '–' : pct(B.score)} ${t.resultsScore} · ${starsString(B.stars || 1)} · ${t.resultsMaxCombo} ×${B.maxCombo || 0}`;
     },
@@ -100,7 +105,7 @@ function benchmarkLines(app, mode, getBenchmark, nameB, waitingText) {
   ];
   const exporter = (kind) => {
     const b = getBenchmark();
-    if (!b) { app.hud.showNotice(waitingText, 2); return; }
+    if (!b) { app.hud.showNotice(waiting(), 2); return; }
     const name = `dp-benchmark-${safeName(b.choreoId)}-${safeName(mode)}-${(b.createdAt || new Date().toISOString()).replace(/[:.]/g, '-')}.${kind}`;
     const ok = kind === 'csv' ? downloadText(name, toCSV(b), 'text/csv') : downloadText(name, toJSON(b), 'application/json');
     app.hud.showNotice(ok ? t.duoExported : t.duoExportFailed, 2);
@@ -230,8 +235,11 @@ export function createOnlineMode(app, opts = {}) {
     remoteResult: null,
     benchmark: null,
     lastResult: null,
+    partnerGone: null,       // reason ('left' | 'disconnected' | 'timeout' | 'abort') once the partner is out
     _unsub: [],
     _connectPromise: null,
+    _resultTimer: null,
+    _reconnectTimer: null,
 
     init(application) {
       const t = application.texts;
@@ -249,6 +257,15 @@ export function createOnlineMode(app, opts = {}) {
       application.on('state', (e) => { if (e.to === 'DUO_LOBBY') m._refresh(); });
     },
 
+    /** Drop the current OnlineDuo (and its listeners) and connect again. */
+    async reconnect() {
+      if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+      if (this._connectPromise) return this._connectPromise;
+      if (this.online) { this.online.dispose(); this.online = null; }
+      this.status = 'idle';
+      return this.ensureConnected();
+    },
+
     // -- connection --------------------------------------------------------------------------
 
     _refresh() {
@@ -263,6 +280,7 @@ export function createOnlineMode(app, opts = {}) {
       const t = app.texts;
       this.status = 'connecting';
       this._refresh();
+      if (this.online) this.online.dispose();   // a dead client must not keep its listeners
       const online = new OnlineDuo({ WebSocketImpl });
       this.online = online;
       this._bindOnline(online);
@@ -290,13 +308,48 @@ export function createOnlineMode(app, opts = {}) {
       online.on('start', (ev) => this._onStart(ev));
       online.on('peer', (ev) => {
         app.hud.showNotice(ev.event === 'joined' ? t.duoPlayerJoined : (ev.event === 'left' ? t.duoPlayerLeft : `${t.duoHost}: ${ev.player ? ev.player.name : ''}`), 3);
+        if (ev.event === 'left') this._partnerGone('left');
+        if (ev.event === 'joined') this.partnerGone = null;
         this._refresh();
       });
-      online.on('room', () => this._refresh());
-      online.on('choreo', (ev) => { if (ev.choreoId && app.choreos.some((c) => c.id === ev.choreoId)) app.selectedChoreoId = ev.choreoId; this._refresh(); });
+      online.on('room', () => { this.partnerGone = null; this._refresh(); });
+      online.on('choreo', (ev) => {
+        if (ev.choreoId && app.choreos.some((c) => c.id === ev.choreoId)) app.selectedChoreoId = ev.choreoId;
+        else if (ev.choreoId && typeof app.loadChoreoList === 'function') app.loadChoreoList().then(() => { if (app.choreos.some((c) => c.id === ev.choreoId)) app.selectedChoreoId = ev.choreoId; this._refresh(); }).catch(() => null);
+        this._refresh();
+      });
       online.on('result', (ev) => this._onRemoteResult(ev));
-      online.on('disconnected', () => { this.status = 'failed'; app.hud.showNotice(t.duoConnectionLost, 4); this._refresh(); });
+      online.on('message', (msg) => { if (msg && msg.type === 'abort') this._onRemoteAbort(msg); });
+      online.on('disconnected', () => {
+        this.status = 'failed';
+        app.hud.showNotice(t.duoConnectionLost, 4);
+        this._partnerGone('disconnected');
+        this._refresh();
+        // one automatic retry while the player is looking at the lobby; the button stays
+        if (app.state === 'DUO_LOBBY' && !this._reconnectTimer) {
+          this._reconnectTimer = setTimeout(() => { this._reconnectTimer = null; if (app.state === 'DUO_LOBBY') this.reconnect().catch(() => null); }, RECONNECT_DELAY_MS);
+        }
+      });
       online.on('error', (ev) => { if (ev.code !== 'RATE_LIMIT') console.warn('[duo] server error', ev.code, ev.message); });
+    },
+
+    /** The partner is out (left / connection lost / no result): finish the round without them. */
+    _partnerGone(reason) {
+      if (this.partnerGone) return;
+      this.partnerGone = reason;
+      if (this._resultTimer) { clearTimeout(this._resultTimer); this._resultTimer = null; }
+      if (this.avatar) this.avatar.visible = false;
+      if (this.lastResult && !this.benchmark) {
+        this._buildBenchmark(this.lastResult);
+        app.hud.showNotice(reason === 'abort' ? app.texts.duoPartnerAborted : app.texts.duoPartnerGone, 4);
+        app.menu.refresh('results');
+      }
+    },
+
+    _onRemoteAbort(msg) {
+      const t = app.texts;
+      app.hud.showNotice(msg.reason === 'start' ? t.duoPartnerStartFailed : t.duoPartnerAborted, 4);
+      this._partnerGone('abort');
     },
 
     get connected() {
@@ -353,17 +406,29 @@ export function createOnlineMode(app, opts = {}) {
     },
 
     _onStart(ev) {
+      const busyStates = ['CALIBRATE', 'COUNTDOWN', 'PLAYING', 'RECORDING', 'RECORD_REVIEW'];
+      if (busyStates.includes(app.state)) { console.warn('[duo] start ignored in state', app.state); return; }
+      // set after the busy check: App.startSolo disposes a RESULTS session first (mode.exit),
+      // which must not touch startInfo - startOptions() reads it when the new session starts
       this.startInfo = ev;
       this.remoteResult = null;
       this.benchmark = null;
-      const busyStates = ['CALIBRATE', 'COUNTDOWN', 'PLAYING', 'RECORDING', 'RECORD_REVIEW'];
-      if (busyStates.includes(app.state)) { console.warn('[duo] start ignored in state', app.state); return; }
+      this.partnerGone = null;
       app.hud.showNotice(app.texts.duoStartingSoon, 3);
-      app.startMode('online', ev.choreoId || app.selectedChoreoId).catch((e) => console.warn('[duo] online start failed', e));
+      const choreoId = ev.choreoId || app.selectedChoreoId;
+      // a dance uploaded after this headset booted is unknown here: refresh the list first
+      const known = !choreoId || app.choreos.some((c) => c.id === choreoId);
+      const ready = known || typeof app.loadChoreoList !== 'function' ? Promise.resolve() : app.loadChoreoList().catch(() => null);
+      ready.then(() => app.startMode('online', choreoId)).catch((e) => {
+        console.warn('[duo] online start failed', e);
+        // tell the partner (who is already counting in) that this side cannot play the dance
+        if (this.online) this.online.send('abort', { reason: 'start', choreoId });
+      });
     },
 
     _onRemoteResult(ev) {
       this.remoteResult = ev && ev.result ? ev.result : null;
+      if (this._resultTimer) { clearTimeout(this._resultTimer); this._resultTimer = null; }
       if (this.lastResult && this.remoteResult) {
         this._buildBenchmark(this.lastResult);
         app.menu.refresh('results');
@@ -394,6 +459,9 @@ export function createOnlineMode(app, opts = {}) {
         }
         items.push({ type: 'button', id: 'leave', text: t.duoLeaveRoom, onClick: () => this.leaveRoom() });
         return items;
+      }
+      if (!this.connected && this.status !== 'connecting') {
+        items.push({ type: 'button', id: 'reconnect', text: t.duoReconnect, primary: true, onClick: () => this.reconnect().catch(() => null) });
       }
       items.push({ type: 'button', id: 'create', text: t.duoCreateRoom, primary: true, disabled: () => !this.connected, onClick: () => this.createRoom().catch(() => null) });
       if (this.codeEdit) {
@@ -435,6 +503,7 @@ export function createOnlineMode(app, opts = {}) {
       const info = this.startInfo;
       if (!info || !Number.isFinite(info.startAtLocalMs)) return null;
       const wait = (info.startAtLocalMs - Date.now()) / 1000;
+      if (wait < -START_INFO_MAX_AGE_MS / 1000) return null;   // stale broadcast from an earlier round
       return { startAt: ctx.clock.sourceNow() + wait };
     },
 
@@ -460,7 +529,9 @@ export function createOnlineMode(app, opts = {}) {
         if (!online) return;
         online.sendStateFromSample(e.t, session.playerS, session.score, session.combo);
         const r = online.getRemoteSample(e.t);
-        if (r && online.remoteStateCount > 0) m._recordRemote(e.t, r);
+        // the sample is interpolated at its own time r.t (= e.t - interpolationDelaySec): record
+        // it there, otherwise the run is shifted by the delay and the benchmark's lag/distance lie
+        if (r && online.remoteStateCount > 0) m._recordRemote(r.t, r);
       }));
       drawScores(this.panel, ctx.texts, ctx.texts.duoYou, 0, this.peerName(), 0, hexColor(AVATAR_COLORS.opponent));
     },
@@ -489,7 +560,8 @@ export function createOnlineMode(app, opts = {}) {
       const r = online.getRemoteSample(session.t);
       if (r && online.remoteStateCount > 0) {
         this.avatar.setSample(r);
-        this.avatar.visible = true;
+        // a partner whose states stopped (headset off, WLAN drop) must not freeze in mid-move
+        this.avatar.visible = !(r.age > PARTNER_STALE_SEC) && !this.partnerGone;
       }
       if (this.panel) drawScores(this.panel, app.texts, app.texts.duoYou, session.score, this.peerName(), online.remoteScore, hexColor(AVATAR_COLORS.opponent));
     },
@@ -503,6 +575,8 @@ export function createOnlineMode(app, opts = {}) {
         nameA: result.player || app.texts.duoYou, nameB: this.peerName(), mode: 'online', choreoId: result.choreoId,
       });
       app.lastBenchmark = this.benchmark;
+      // the App stored/uploaded the result before the partner's arrived: attach it now
+      if (typeof app.attachBenchmark === 'function') app.attachBenchmark(this.benchmark, result);
       return this.benchmark;
     },
 
@@ -510,9 +584,14 @@ export function createOnlineMode(app, opts = {}) {
       const t = ctx.texts;
       this.lastResult = result;
       if (this.online) this.online.sendResult(result);
-      if (this.remoteResult) this._buildBenchmark(result);
+      if (this.remoteResult || this.partnerGone) this._buildBenchmark(result);
+      else {
+        // never wait forever for the partner (heartbeat kill, WLAN drop, headset put down)
+        if (this._resultTimer) clearTimeout(this._resultTimer);
+        this._resultTimer = setTimeout(() => { this._resultTimer = null; this._partnerGone('timeout'); }, RESULT_TIMEOUT_MS);
+      }
       if (this.panel) drawScores(this.panel, t, t.duoYou, result.score, this.peerName(), this.online ? this.online.remoteScore : 0, hexColor(AVATAR_COLORS.opponent));
-      return benchmarkLines(app, 'online', () => this.benchmark, () => this.peerName(), t.duoWaitingResult);
+      return benchmarkLines(app, 'online', () => this.benchmark, () => this.peerName(), () => (this.partnerGone ? t.duoRemoteMissing : t.duoWaitingResult));
     },
 
     exit(ctx) {
@@ -527,10 +606,14 @@ export function createOnlineMode(app, opts = {}) {
         ctx.hud.removePanel('duo');
         this.panel = null;
       }
-      this.startInfo = null;
+      if (this._resultTimer) { clearTimeout(this._resultTimer); this._resultTimer = null; }
+      // startInfo is kept: App.startSolo calls exit() for the previous (RESULTS) session before
+      // the new one reads startOptions(); a stale value is rejected there by its age
     },
 
     dispose() {
+      if (this._resultTimer) { clearTimeout(this._resultTimer); this._resultTimer = null; }
+      if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
       if (this.online) { this.online.dispose(); this.online = null; }
       this.status = 'idle';
     },

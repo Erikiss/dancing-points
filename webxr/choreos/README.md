@@ -78,8 +78,9 @@ drei Punkte).
 ### Wo die Dateien hingehören
 
 * **Mitgeliefert (im App-Ordner):** `webxr/choreos/<id>.json` ablegen **und** in `index.json`
-  eintragen (`file` relativ zu diesem Ordner). Danach ggf. den Service-Worker-Cache leeren
-  (Seite neu laden).
+  eintragen (`file` relativ zu diesem Ordner). Die Brillen holen `index.json` und die
+  Tanzdateien bei jedem Start frisch vom Server (Service Worker: network-first, Cache nur als
+  Offline-Ersatz) – ein Neuladen der Seite genügt.
 * **Über den LAN-Server:** `POST /api/choreos` (JSON-Body) oder die Datei direkt nach
   `data/choreos/` legen; der Server mischt sie automatisch in `GET /api/choreos`.
 * **Nur lokal im Headset:** Aufnahmen ohne Server bleiben im Browser-Speicher

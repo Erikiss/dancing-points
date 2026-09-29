@@ -24,7 +24,7 @@ const __dirname = path.dirname(__filename);
 // ---------------------------------------------------------------------------------------------
 // Constants
 
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = '0.1.1';
 export const WS_PATH = '/ws';
 export const MAX_WS_MESSAGE = 4096;          // bytes per WebSocket message
 export const RATE_PER_SEC = 30;              // messages per second per client
@@ -83,9 +83,14 @@ const MIME = {
   '.xml': 'application/xml; charset=utf-8',
   '.pdf': 'application/pdf',
 };
-// files whose content changes between deployments and must always be revalidated
+// files whose content changes between deployments and must always be revalidated (ETag/304);
+// app modules under src/ too, so a bug fix reaches the headsets without a cache expiry
 const NO_CACHE_EXT = new Set(['.html', '.htm', '.json', '.webmanifest']);
 const NO_CACHE_NAMES = new Set(['sw.js']);
+const NO_CACHE_DIRS = ['src', 'choreos'];
+const TOKEN_HEADER = 'x-dp-token';
+const DRAIN_MAX = 64 * 1024 * 1024;   // discard at most this much of an over-limit body before cutting the socket
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
 // ---------------------------------------------------------------------------------------------
 // CLI
@@ -104,6 +109,9 @@ Aufruf: node server/server.js [Optionen]
   --dir <pfad>      Verzeichnis der Web-App (Standard: ../webxr relativ zu server.js)
   --data <pfad>     Datenverzeichnis fuer Zertifikat, Uploads, Ergebnisse (Standard: ./data neben server.js)
   --cert <pem> --key <pem>   eigenes Zertifikat statt des selbstsignierten
+  --token <geheim>  schreibende API-Aufrufe (POST/DELETE) brauchen den Header X-Dp-Token
+                    (die App bekommt ihn einmalig per ?token=... in der URL); ohne --token sind
+                    DELETE-Aufrufe nur von localhost erlaubt
   --no-coep         Cross-Origin-Isolation-Header (COOP/COEP) weglassen
   --verbose         jede Anfrage loggen
   --quiet           nur Fehler ausgeben
@@ -122,6 +130,7 @@ export function parseArgs(argv) {
     data: path.resolve(__dirname, 'data'),
     cert: null,
     key: null,
+    token: null,
     coep: true,
     verbose: false,
     quiet: false,
@@ -151,6 +160,7 @@ export function parseArgs(argv) {
       case '--data': opts.data = path.resolve(process.cwd(), next(i, a)); i++; break;
       case '--cert': opts.cert = path.resolve(process.cwd(), next(i, a)); i++; break;
       case '--key': opts.key = path.resolve(process.cwd(), next(i, a)); i++; break;
+      case '--token': opts.token = String(next(i, a)); i++; break;
       case '--no-coep': opts.coep = false; break;
       case '--verbose': opts.verbose = true; break;
       case '--quiet': opts.quiet = true; break;
@@ -164,6 +174,7 @@ export function parseArgs(argv) {
     }
   }
   if (!opts.http && !opts.https) throw new Error('Mindestens einer von HTTP/HTTPS muss aktiv sein');
+  if (opts.token !== null && !/^[A-Za-z0-9_.-]{4,128}$/.test(opts.token)) throw new Error('--token: 4-128 Zeichen aus A-Z a-z 0-9 _ . -');
   return opts;
 }
 
@@ -290,6 +301,51 @@ export function validateResult(r) {
   if (r.moves !== undefined && (!Array.isArray(r.moves) || r.moves.length > 256)) errors.push('moves must be an array (<= 256)');
   if (r.perBeat !== undefined && (!Array.isArray(r.perBeat) || r.perBeat.length > 8192)) errors.push('perBeat must be an array (<= 8192)');
   return { ok: errors.length === 0, errors };
+}
+
+const RESULT_STRING_MAX = { player: 64, mode: 24, playedAt: 40, choreoTitle: 200 };
+const MOVE_STRING_MAX = { name: 64, grade: 16 };
+const MOVE_NUMBERS = ['score', 'startBeat', 'endBeat', 'ticks'];
+const BENCHMARK_MAX_BYTES = 8192;
+
+/**
+ * Copy of a (validated) result with only the known fields, capped: unknown keys are dropped,
+ * strings cut, `moves` <= 256 small objects, `perBeat` <= 8192 numbers, `benchmark` a small
+ * object. Keeps a client from pinning arbitrary JSON in memory / results.json.
+ */
+export function sanitizeResult(r) {
+  const out = { choreoId: r.choreoId, score: r.score };
+  for (const k of ['stars', 'maxCombo', 'timingBias', 'durationSec', 'ticks', 'meanFrameScore']) if (isNum(r[k])) out[k] = r[k];
+  if (typeof r.mirror === 'boolean') out.mirror = r.mirror;
+  for (const k of Object.keys(RESULT_STRING_MAX)) if (typeof r[k] === 'string') out[k] = r[k].slice(0, RESULT_STRING_MAX[k]);
+  if (Array.isArray(r.moves)) {
+    out.moves = r.moves.slice(0, 256).map((m) => {
+      const mv = {};
+      if (!m || typeof m !== 'object') return mv;
+      for (const k of Object.keys(MOVE_STRING_MAX)) if (typeof m[k] === 'string') mv[k] = m[k].slice(0, MOVE_STRING_MAX[k]);
+      for (const k of MOVE_NUMBERS) if (isNum(m[k])) mv[k] = m[k];
+      if (typeof m.gated === 'boolean') mv.gated = m.gated;
+      return mv;
+    });
+  }
+  if (Array.isArray(r.perBeat)) out.perBeat = r.perBeat.slice(0, 8192).map((v) => (isNum(v) ? v : 0));
+  if (r.benchmark && typeof r.benchmark === 'object' && !Array.isArray(r.benchmark)) {
+    const b = r.benchmark;
+    const compact = {};
+    if (typeof b.mode === 'string') compact.mode = b.mode.slice(0, 24);
+    if (typeof b.winner === 'string') compact.winner = b.winner.slice(0, 8);
+    if (b.pair && typeof b.pair === 'object' && !Array.isArray(b.pair)) {
+      compact.pair = {};
+      for (const k of Object.keys(b.pair).slice(0, 16)) { const v = b.pair[k]; if (isNum(v) || v === null) compact.pair[k.slice(0, 32)] = v; }
+    }
+    if (b.partner && typeof b.partner === 'object' && !Array.isArray(b.partner)) {
+      const p = b.partner;
+      compact.partner = { name: typeof p.name === 'string' ? p.name.slice(0, 64) : '' };
+      for (const k of ['score', 'stars', 'maxCombo']) if (isNum(p[k]) || p[k] === null) compact.partner[k] = p[k];
+    }
+    if (JSON.stringify(compact).length <= BENCHMARK_MAX_BYTES) out.benchmark = compact;
+  }
+  return out;
 }
 
 /** Accepts `dancing-points-run/1` (head[7]/left[3]/right[3]) or the compact `frames[[9]]` layout. */
@@ -420,11 +476,10 @@ class DataStore {
   // -- results ---------------------------------------------------------------------------------
 
   addResult(r) {
-    const stored = { ...r };
+    const stored = sanitizeResult(r);
     stored.id = timeId('r');
     stored.receivedAt = new Date().toISOString();
     if (typeof stored.playedAt !== 'string') stored.playedAt = stored.receivedAt;
-    if (typeof stored.player === 'string') stored.player = stored.player.slice(0, 64);
     this.results.push(stored);
     if (this.results.length > MAX_RESULTS) this.results.splice(0, this.results.length - MAX_RESULTS);
     this._scheduleResultsWrite();
@@ -594,19 +649,29 @@ function readBody(req, limit) {
     }
     const chunks = [];
     let size = 0;
+    let done = false;
     req.on('data', (chunk) => {
       size += chunk.length;
+      if (done) {
+        // over the limit: keep draining (discarding) so the client can read the 413 - closing
+        // the socket with unread data would RST the connection and the client would only see
+        // a reset; a runaway upload is cut after DRAIN_MAX bytes
+        if (size > DRAIN_MAX) req.destroy();
+        return;
+      }
       if (size > limit) {
+        done = true;
+        chunks.length = 0;
         const err = new Error('body too large');
         err.status = 413;
-        req.destroy();
+        err.overflow = true;
         reject(err);
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => { if (!done) resolve(Buffer.concat(chunks)); });
+    req.on('error', (e) => { if (!done) { done = true; reject(e); } });
   });
 }
 
@@ -626,17 +691,22 @@ async function readJSONBody(req, limit) {
   }
 }
 
-function sendFile(req, res, file, stat, headers) {
+function sendFile(req, res, file, stat, headers, root = null) {
   const ext = path.extname(file).toLowerCase();
   const base = path.basename(file);
   const type = MIME[ext] || 'application/octet-stream';
   const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+  let noCache = NO_CACHE_EXT.has(ext) || NO_CACHE_NAMES.has(base);
+  if (!noCache && root) {
+    const rel = path.relative(root, file).split(path.sep);
+    if (NO_CACHE_DIRS.includes(rel[0])) noCache = true;
+  }
   const h = {
     'Content-Type': type,
     'ETag': etag,
     'Last-Modified': stat.mtime.toUTCString(),
     'Accept-Ranges': 'bytes',
-    'Cache-Control': NO_CACHE_EXT.has(ext) || NO_CACHE_NAMES.has(base) ? 'no-cache' : 'public, max-age=3600',
+    'Cache-Control': noCache ? 'no-cache' : 'public, max-age=3600',
     ...headers,
   };
   if (req.headers['if-none-match'] === etag) {
@@ -1032,6 +1102,7 @@ export class DancingPointsServer {
       rooms: this.relay.rooms.size,
       clients: this.relay.clients.size,
       choreoValidator: this.validatorKind,
+      auth: this.opts.token ? 'token' : 'none',
       limits: { wsMessageBytes: MAX_WS_MESSAGE, wsMessagesPerSec: RATE_PER_SEC, runsPerChoreo: MAX_RUNS_PER_CHOREO, maxPlayers: MAX_ROOM_PLAYERS },
     };
   }
@@ -1057,9 +1128,33 @@ export class DancingPointsServer {
       res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
       res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
     }
-    // lets other origins (e.g. the app served from GitHub Pages with ?server=) embed our files
+    // lets other origins (e.g. the app served from GitHub Pages with ?server=) embed AND fetch
+    // our files (choreo JSON + audio are loaded with fetch(), i.e. CORS mode); LAN only, harmless
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('X-Content-Type-Options', 'nosniff');
+  }
+
+  /**
+   * Mutating API calls: with --token the header X-Dp-Token (or ?token=) must match; without a
+   * token DELETE is only accepted from the loopback interface (the headsets need POST for
+   * results/runs/recordings, but nobody on the venue WLAN should be able to wipe them).
+   */
+  _authorize(req, url, method) {
+    if (method !== 'POST' && method !== 'DELETE') return null;
+    const token = this.opts.token;
+    if (token) {
+      const given = req.headers[TOKEN_HEADER] || url.searchParams.get('token') || '';
+      const a = Buffer.from(String(given)), b = Buffer.from(token);
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) return null;
+      return { status: 401, message: 'Zugriff verweigert: Token fehlt oder ist falsch (Server-Option --token, App-Parameter ?token=)' };
+    }
+    if (method === 'DELETE') {
+      const remote = req.socket ? req.socket.remoteAddress : '';
+      if (LOOPBACK.has(remote)) return null;
+      return { status: 403, message: 'Loeschen ist nur von localhost erlaubt (oder mit Server-Option --token)' };
+    }
+    return null;
   }
 
   async _handle(req, res) {
@@ -1122,13 +1217,12 @@ export class DancingPointsServer {
       res.end('404 Not Found');
       return;
     }
-    sendFile(req, res, file, stat);
+    sendFile(req, res, file, stat, undefined, root);
   }
 
   async _api(req, res, url) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Dp-Token');
     res.setHeader('Access-Control-Max-Age', '600');
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
     const parts = url.pathname.split('/').filter(Boolean);   // ['api', 'choreos', ':id']
@@ -1136,6 +1230,8 @@ export class DancingPointsServer {
     const id = parts[2];
     if (parts.length > 3) { sendError(res, 404, 'not found'); return; }
     const method = req.method;
+    const denied = this._authorize(req, url, method);
+    if (denied) { req.resume(); sendError(res, denied.status, denied.message); return; }
     try {
       switch (resource) {
         case 'info':
@@ -1156,7 +1252,11 @@ export class DancingPointsServer {
           return sendError(res, 404, 'not found');
       }
     } catch (err) {
-      if (err && err.status) return sendError(res, err.status, err.message);
+      if (err && err.status) {
+        // an over-limit streaming body is drained (readBody / Node's own dump after the response),
+        // so the client reads a real 413 instead of a connection reset
+        return sendError(res, err.status, err.message);
+      }
       throw err;
     }
   }
@@ -1332,6 +1432,7 @@ async function main() {
     log.info(`HTTPS auf Port ${server.httpsPort}${cert.custom ? ' (eigenes Zertifikat)' : cert.generated ? ' (neues selbstsigniertes Zertifikat)' : ' (selbstsigniertes Zertifikat)'}`);
   }
   if (server.httpServer) log.info(`HTTP auf Port ${server.httpPort} (nur fuer localhost/Tests - WebXR braucht HTTPS)`);
+  log.info(opts.token ? 'API-Schreibzugriff nur mit Token (X-Dp-Token / ?token=)' : 'Kein API-Token (--token): jeder im WLAN darf hochladen, Loeschen nur von localhost');
   const urls = server.urls();
   if (urls.length) {
     log.info('Auf der Quest im Browser oeffnen:');

@@ -49,6 +49,12 @@ export function createButtonState() {
     thumb: [0, 0],     // thumbstick axes
     connected: false,
     isHand: false,
+    // XRInput only: debounced trigger/squeeze state (gamepad `pressed` flag when the controller
+    // reports one, otherwise a Schmitt trigger on the analog value: press >= 0.6, release <= 0.4)
+    triggerDown: false,
+    squeezeDown: false,
+    triggerPressed: null,
+    squeezePressed: null,
   };
 }
 
@@ -70,6 +76,15 @@ function setPose(point, pose) {
 }
 
 const PRESS_THRESHOLD = 0.5;
+export const PRESS_ON = 0.6;    // analog value at which a trigger/squeeze counts as pressed
+export const PRESS_OFF = 0.4;   // ... and below which it counts as released again (hysteresis)
+
+/** Debounced digital state of an analog button (Schmitt trigger, or the gamepad's own flag). */
+function debounce(value, pressedFlag, wasDown) {
+  if (pressedFlag === true) return true;
+  if (pressedFlag === false && value < PRESS_ON) return false;
+  return wasDown ? value > PRESS_OFF : value >= PRESS_ON;
+}
 
 export class XRInput {
   /** @param {object} [opts] { session } the XRSession (may also be passed to update()) */
@@ -202,6 +217,13 @@ export class XRInput {
     if (!rightSeen) s.right.valid = false;
     // 'none' handedness select (e.g. gaze/tap input) counts as a right trigger
     if (this._selectHeld.none) this.buttons.right.trigger = Math.max(this.buttons.right.trigger, 1);
+    // debounce the analog buttons (a half-pulled trigger hovering around the threshold must not
+    // produce a burst of justPressed() edges)
+    for (const hand of HANDS) {
+      const btn = this.buttons[hand], prev = this._prev[hand];
+      btn.triggerDown = debounce(btn.trigger, btn.triggerPressed, prev.triggerDown);
+      btn.squeezeDown = debounce(btn.squeeze, btn.squeezePressed, prev.squeezeDown);
+    }
     return s;
   }
 
@@ -238,10 +260,12 @@ function handOf(ev) {
   return h === 'left' || h === 'right' ? h : 'none';
 }
 
+const HANDS = ['left', 'right'];
+
 function isPressed(b, name) {
   switch (name) {
-    case 'trigger': return b.trigger >= PRESS_THRESHOLD;
-    case 'squeeze': return b.squeeze >= PRESS_THRESHOLD;
+    case 'trigger': return b.triggerDown;
+    case 'squeeze': return b.squeezeDown;
     case 'stick': return b.stick;
     case 'primary': return b.primary;
     case 'secondary': return b.secondary;
@@ -255,11 +279,14 @@ function copyButtons(dst, src) {
   dst.primary = src.primary; dst.secondary = src.secondary; dst.menu = src.menu;
   dst.thumb[0] = src.thumb[0]; dst.thumb[1] = src.thumb[1];
   dst.connected = src.connected; dst.isHand = src.isHand;
+  dst.triggerDown = src.triggerDown; dst.squeezeDown = src.squeezeDown;
+  dst.triggerPressed = src.triggerPressed; dst.squeezePressed = src.squeezePressed;
 }
 
 function resetButtons(b) {
   b.trigger = 0; b.squeeze = 0; b.stick = false; b.primary = false; b.secondary = false; b.menu = false;
   b.thumb[0] = 0; b.thumb[1] = 0; b.connected = false; b.isHand = false;
+  b.triggerDown = false; b.squeezeDown = false; b.triggerPressed = null; b.squeezePressed = null;
 }
 
 /** xr-standard gamepad mapping (Oculus Touch): 0 trigger, 1 squeeze, 3 stick, 4 A/X, 5 B/Y. */
@@ -270,6 +297,9 @@ function readGamepad(btn, gp) {
   const pressed = (i) => (b[i] ? (b[i].pressed === true || val(i) >= PRESS_THRESHOLD) : false);
   btn.trigger = Math.max(btn.trigger, val(0));
   btn.squeeze = Math.max(btn.squeeze, val(1));
+  // the controller's own digital flag (with its hysteresis) when the gamepad reports one
+  if (b[0] && typeof b[0].pressed === 'boolean') btn.triggerPressed = b[0].pressed;
+  if (b[1] && typeof b[1].pressed === 'boolean') btn.squeezePressed = b[1].pressed;
   btn.stick = pressed(3);
   btn.primary = pressed(4);
   btn.secondary = pressed(5);

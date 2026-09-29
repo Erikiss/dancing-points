@@ -2,7 +2,7 @@
 // Pure data + a tiny parser; importable in Node (no window/location access at import time
 // except through the guarded `params` export). No three.js imports.
 
-export const APP_VERSION = '0.1.0';
+export const APP_VERSION = '0.1.1';   // bump together with SW_VERSION in webxr/sw.js (tests/unit/sw.test.js)
 export const APP_NAME = 'Dancing Points VR';
 
 // Scoring constants (DESIGN.md section 7).
@@ -52,6 +52,9 @@ export const FLOW = Object.freeze({
   defaultCountInBeats: 4,
   calibrationHoldSec: 1.0,  // hold the trigger this long to calibrate (XR)
   calibrationEmuSec: 3.0,   // in emu mode calibration completes after this delay
+  calibrationReuseWaitSec: 2.0, // 'Bereit?' pause before the count-in when a persisted calibration is reused
+  quitHoldSec: 2.5,         // hold B/Y this long to abort a run / recording / calibration (XR)
+  networkTimeoutMs: 3000,   // boot-time probes (api/info, choreo list) and result uploads
   audioLookaheadSec: 0.1,   // WebAudio scheduling lookahead
   runRecordHz: 30,          // player run recording rate for ghost duo
   duoStateHz: 15,           // online duo state send rate
@@ -80,6 +83,7 @@ export const DEFAULT_PARAMS = Object.freeze({
   style: 'free',      // model set
   telemetry: false,
   lang: 'de',
+  token: null,        // API token of server/server.js --token (sent as X-Dp-Token on POST/DELETE)
 });
 
 function toNumber(value, fallback) {
@@ -134,6 +138,8 @@ export function parseParams(search = '') {
   out.telemetry = toBool(get('telemetry'), out.telemetry);
   const lang = get('lang');
   if (lang && (lang === 'de' || lang === 'en')) out.lang = lang;
+  const token = get('token');
+  if (token && /^[A-Za-z0-9_.-]{1,128}$/.test(token)) out.token = token;
   return out;
 }
 

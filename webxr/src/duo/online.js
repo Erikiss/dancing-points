@@ -476,6 +476,11 @@ export class OnlineDuo extends EventEmitter {
   _pushRemote(msg) {
     const head = msg.head, left = msg.left, right = msg.right;
     if (!isNum(msg.t) || !Array.isArray(head) || head.length < 3 || !Array.isArray(left) || left.length < 3 || !Array.isArray(right) || right.length < 3) return;
+    // the server relays states verbatim: a misbehaving peer must not inject NaN into the avatar
+    // and the benchmark metrics
+    const nq = head.length >= 7 ? 7 : 3;
+    for (let i = 0; i < nq; i++) if (!isNum(head[i])) return;
+    for (let i = 0; i < 3; i++) if (!isNum(left[i]) || !isNum(right[i])) return;
     const size = this._buf.length;
     this._bufHead = (this._bufHead + 1) % size;
     if (this._bufCount < size) this._bufCount++;
@@ -484,8 +489,8 @@ export class OnlineDuo extends EventEmitter {
     for (let i = 0; i < 3; i++) { s.head[i] = head[i]; s.left[i] = left[i]; s.right[i] = right[i]; }
     if (head.length >= 7) { s.head[3] = head[3]; s.head[4] = head[4]; s.head[5] = head[5]; s.head[6] = head[6]; }
     else { s.head[3] = 0; s.head[4] = 0; s.head[5] = 0; s.head[6] = 1; }
-    s.score = isNum(msg.score) ? msg.score : 0;
-    s.combo = isNum(msg.combo) ? msg.combo : 0;
+    s.score = isNum(msg.score) ? Math.min(100, Math.max(0, msg.score)) : 0;
+    s.combo = isNum(msg.combo) ? Math.min(1e6, Math.max(0, Math.floor(msg.combo))) : 0;
     s.recvAt = this.now();
     this.stats.remoteStates++;
   }

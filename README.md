@@ -1,3 +1,221 @@
+# Dancing Points VR – Tanzspiel für Meta Quest 2
+
+Ein Just‑Dance‑artiges VR‑Tanzspiel für die **Meta Quest 2**, gebaut auf der *Dancing Points*‑Technologie
+dieses Repositories: Aus den drei getrackten Punkten der Brille (Kopf + beide Controller/Hände)
+werden Tänze bewertet und ein Ganzkörper‑Avatar berechnet. Die App läuft **ohne Installation im
+Quest‑Browser** (WebXR), lässt sich als PWA/APK für den Arcade‑Betrieb paketieren und ist für
+den WLAN‑Betrieb mit eigenen Songs und eigenen (TikTok‑)Tänzen ausgelegt.
+
+Was drin ist:
+
+- **Menü mit Tänzen**, Kalibrierung, Count‑in, Live‑Scoring (Punkte, Combo, Bewertung pro Move),
+  Ergebnisbildschirm mit Sternen und Bestenliste.
+- **Snoop Dogg C‑Walk – 6 Basic Combos** (Shoe Vibe, Restep, Heel Toe, Side Hopping, Shuffle Legs,
+  Gangster Two Step; 48 Beats bei 90 BPM ≈ 32 s), ein **Tutorial** und eine **Mocap‑Demo**.
+- **Duo‑Modus**: gegen einen „Geist“ (gespeicherter Lauf) oder **online gegen eine zweite Brille im
+  selben WLAN**, mit Benchmark‑Metriken (Punkte, Synchronität, Verzögerung) und JSON/CSV‑Export.
+- **Aufnahme‑Modus**: eigene Tänze direkt im Headset aufnehmen (z. B. ein TikTok‑Video nachtanzen)
+  und als Choreografie speichern.
+- **Neuronaler Avatar**: die Mapping‑ und Tracking‑Netze aus dem Paper laufen im Browser
+  (onnxruntime‑web, int8‑quantisiert) und zeigen einen Ganzkörper‑Spiegel‑Avatar des Spielers.
+- **LAN‑Server** (Node.js) für WLAN‑Betrieb: statische App, Upload von Tänzen, Ergebnisse,
+  WebSocket‑Relay für den Online‑Duo.
+
+Entwicklerdoku (Architektur, Formate, Pipeline‑Spezifikation): [`docs/DESIGN.md`](docs/DESIGN.md).
+Nativer Port (Unity/Meta XR): [`docs/NATIVE_PORT.md`](docs/NATIVE_PORT.md).
+Änderungen: [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
+
+## Sofort auf der Quest 2 ausprobieren
+
+WebXR braucht eine **HTTPS‑Adresse** (oder `localhost`). Drei Wege:
+
+**1. GitHub Pages (einfachster Weg, echtes HTTPS, Offline‑Cache funktioniert)**
+
+Einmalig vom Repo‑Besitzer: *Settings → Pages → Source: „GitHub Actions“*. Der Workflow
+`.github/workflows/pages.yml` veröffentlicht danach bei jedem Push auf `main` den Ordner `webxr/`.
+Die Adresse lautet dann `https://<github-nutzer>.github.io/dancing-points/` – im Quest‑Browser
+öffnen, **„VR starten“** drücken. Die Modelle (≈ 85 MB) werden beim ersten Start geladen und vom
+Service Worker gecacht; danach startet die App auch ohne Internet.
+
+**2. Eigener PC im WLAN (Arcade‑Betrieb, eigene Tänze, Online‑Duo)**
+
+```bash
+npm install            # installiert auch server/ (ws, selfsigned)
+node server/server.js  # HTTPS auf :8443, HTTP auf :8080 (nur localhost sinnvoll)
+```
+
+Der Server druckt die LAN‑Adresse, z. B. `https://192.168.1.20:8443/`. Im Quest‑Browser öffnen und
+die Zertifikatswarnung **einmalig** bestätigen („Erweitert → Weiter zu …“). Hinweis: Mit dem
+selbstsignierten Zertifikat registriert der Browser **keinen Service Worker** (kein Offline‑Cache,
+keine PWA‑Installation); die App funktioniert trotzdem, Modelle liegen dann im normalen
+Browser‑Cache. Für Offline/PWA im LAN ein vertrauenswürdiges Zertifikat verwenden
+(`--cert/--key`, Anleitung in [`server/README.md`](server/README.md)).
+
+**3. Am PC testen (ohne Brille)**
+
+`npm run start:http` und `http://localhost:8080/?emu=1` öffnen: Desktop‑Modus mit Maus/Tastatur
+(WASD/Maus = Kopf, Tasten heben die Hände). `?emu=playback&choreo=snoop-cwalk&autostart=1` spielt
+die Referenz selbst nach (Score ≈ 100); `&noise=0.35` zeigt das Gegenteil.
+
+## Bedienung in VR
+
+1. **Kalibrieren**: auf den Ring am Boden stellen, Richtung Bühne schauen, Trigger 1 s halten
+   (Abbruch mit B/Y). Die Kalibrierung merkt sich Kopfhöhe und Blickrichtung; alle Tänze werden auf
+   eine Referenzgröße von 1,70 m normiert, damit große und kleine Spieler vergleichbar sind.
+2. **Menü**: Laserpointer mit dem Controller, Trigger = auswählen. Punkte: *Tanzen*, *Duo‑Modus*,
+   *Neuen Tanz aufnehmen*, *Bestenliste*, *Einstellungen* (Avatar Neural/Punkte/Aus, Lautstärke,
+   Spielername, Server, Telemetrie‑Export, Sprache, neu kalibrieren).
+3. **Tanzen**: Count‑in (4 Beats mit Klick), dann tanzt die Lehrer‑Figur 2,5 m vor dir; bei
+   TikTok‑Tänzen (`mirror: true`) gespiegelt und dir zugewandt. Das HUD zeigt Punkte, Combo, aktuellen
+   und nächsten Move. **B/Y 2 s halten** bricht ab.
+4. **Ergebnis**: Gesamtpunkte (0–100), Sterne, Bewertung pro Move (Perfekt/Gut/OK/Daneben), Combo,
+   Timing‑Abweichung (früh/spät). Ergebnisse landen in der Bestenliste (lokal und, falls vorhanden,
+   auf dem Server).
+
+Bewertet werden Kopfposition, Handpositionen relativ zum Kopf und die Bewegungsgeschwindigkeit
+gegen die Referenz, mit ±200 ms Toleranz. Wer stillsteht, bekommt maximal 40 Punkte pro Move
+(„Energie‑Sperre“). Die Toleranzen stehen in `webxr/src/config.js` (`SCORING`) und sollten nach den
+ersten Tests mit echten Spielern nachjustiert werden – die Voreinstellung ist streng.
+
+## Die mitgelieferten Tänze
+
+| ID | Titel | Beats/BPM | Hinweis |
+|---|---|---|---|
+| `snoop-cwalk` | Snoop Dogg C‑Walk – 6 Basic Combos | 48 @ 90 | **Prozedurale v0**: Kopf‑Bounce/Sway/Hops und Armschwung je Combo sind aus der Beschreibung der Schritte konstruiert, nicht aus dem Video. Die echte Version im Headset aufnehmen (siehe unten) – die Aufnahme ersetzt die Datei. |
+| `tutorial-basics` | Tutorial: Grundschritte | 32 @ 80 | Wippen, Seitwärts, Arme hoch, Freestyle |
+| `mocap-freestyle` | Freestyle (Mocap‑Demo) | 50 @ 100 | 30‑s‑Ausschnitt aus dem Forschungs‑Datensatz mit echter Ganzkörper‑Referenz. **Nur Demo/Test** – der Datensatz ist Forschungsmaterial der Paper‑Autoren, keine kommerzielle Lizenz. Bei Bedarf Datei und Eintrag in `webxr/choreos/index.json` entfernen. |
+
+C‑Walk ist Fußarbeit. Die Brille sieht nur Kopf und Hände, deshalb bewertet das Spiel das, was die
+Fußarbeit im Oberkörper auslöst (Wippen, Verlagerung, Hüpfer, Armschwung). Genau darum ist die
+Aufnahme im Headset der richtige Weg zu einer glaubwürdigen Referenz.
+
+## Eigene Tänze und Songs (WLAN‑Betrieb)
+
+**Tanz aufnehmen (empfohlen):** Menü → *Neuen Tanz aufnehmen* → Titel, BPM (Tap‑Tempo), Takte,
+Count‑in → kalibrieren → mit dem Metronom tanzen (z. B. das TikTok‑Video am Monitor mitlaufen
+lassen) → ansehen → *Speichern*. Mit Server wird die Choreografie hochgeladen
+(`POST /api/choreos`) und erscheint auf allen Brillen unter *Eigene Tänze*; ohne Server bleibt sie
+im Browser (localStorage) und kann als JSON heruntergeladen werden. Move‑Namen (Standard
+„Teil 1…n“) lassen sich später in der JSON ändern.
+
+**Musik:** Die App liefert **keine urheberrechtlich geschützte Musik** mit, sondern synthetische
+Beats (`audio.synth`: `hiphop`, `house`, `metronome`). Ein eigener Song wird per `audio.url` in der
+Choreografie eingetragen und vom Server ausgeliefert (`server/data/…` oder `webxr/choreos/`).
+Die Lizenz (GEMA/Rechteinhaber) ist Sache des Betreibers.
+
+**Format:** Choreografien sind JSON (`dancing-points-choreo/1`): Kopfpose und Handpositionen mit
+30 fps im Bühnen‑Koordinatensystem plus Move‑Liste in Beats. Details und ein Generator für
+prozedurale Tänze: [`webxr/choreos/README.md`](webxr/choreos/README.md), `tools/gen_choreos.js`.
+
+## Duo‑Modus und Benchmark
+
+- **Duo (Geist)**: eine Brille, der zweite Tänzer ist ein gespeicherter Lauf (eigener Bestwert oder
+  ein Lauf vom Server). Beide Punktzahlen live im HUD.
+- **Duo (Online)**: zwei Brillen im selben WLAN + `server/`. Host erstellt einen Raum (4‑Buchstaben‑
+  Code), Gast tritt bei, beide kalibrieren, der Host startet; die Uhren werden über den Server
+  synchronisiert (NTP‑artig, Median aus 5 Messungen). Der Partner wird als Avatar neben der
+  Lehrer‑Figur gezeigt. Bei Verbindungsabbruch wird neu verbunden; ohne Partner‑Daten bricht die
+  Runde nach einem Timeout sauber ab.
+- **Benchmark**: pro Spieler Punkte/Sterne/Moves; als Paar `syncDistance` (mittlerer 3‑Punkt‑Abstand
+  nach Offset‑Bereinigung), `syncLag` (Kreuzkorrelation der Kopfgeschwindigkeit, Sekunden) und Sieger.
+  Export als JSON/CSV im Ergebnisbildschirm; Speicherung lokal und unter `POST /api/results`.
+
+## Der neuronale Avatar (Dancing‑Points‑Netze im Browser)
+
+Pro Tick (30 Hz) sagt `mapping_leader` aus den letzten 0,5 s der drei Punkte die kommende Sekunde
+voraus, und `tracking_leader` erzeugt daraus autoregressiv die nächste Ganzkörper‑Pose
+(34 Gelenke). Die Laufzeit‑Pipeline (Root aus der Kopfpose, relative Root‑Motion, kanal‑major
+Tensoren, Nachbearbeitung) ist in `webxr/src/net/pipeline.js` portiert und gegen eine
+numpy‑Referenz (`tools/dp_pipeline.py`) und den Original‑Datensatz verifiziert:
+
+| Prüfung (Stil „free“, Datensatz‑Clip) | Ergebnis |
+|---|---|
+| Laufzeit‑Preprocessing vs. Trainings‑Preprocessing | Abweichung < 2e‑6 |
+| Mapping: Vorhersage der nächsten 30 Frames vs. Ground Truth | 12,6 cm (statische Baseline 35 cm) |
+| Tracking: nächste Pose bei bekannter Zukunft | 3,5 cm mittlerer Gelenkfehler |
+| Geschlossener Regelkreis 10 s (mit Root‑Korrektur) | 9,4 cm; Drift 1,3 cm |
+| int8 vs. fp32 | < 0,5 cm Unterschied, 4× kleiner, 4× schneller |
+
+Modelle: `webxr/models/free/` (int8, 35 MB + 51 MB, plus `meta.json`, `skeleton.json`,
+`init_pose.json`). Im Browser läuft die Inferenz in einem Web Worker; ein **Performance‑Guard**
+misst die Inferenzzeit und schaltet bei > 25 ms auf 15 Hz und bei > 60 ms auf den leichten
+Punkte‑Avatar um (HUD‑Hinweis). Auf einem Desktop‑Kern braucht ein Tick ≈ 30 ms, mit mehreren
+WASM‑Threads ≈ 16 ms; Threads gibt es nur bei *Cross‑Origin‑Isolation* (der LAN‑Server setzt die
+nötigen COOP/COEP‑Header, GitHub Pages nicht). **Erwartung für die Quest 2:** ohne Threads greift
+der Guard vermutlich und zeigt den Punkte‑Avatar; mit dem LAN‑Server ist der Ganzkörper‑Avatar bei
+15 Hz realistisch. Das ist mit der echten Brille zu prüfen (`?avatar=neural` erzwingt den Versuch).
+
+**Andere Stile / eigene Netze:** Checkpoints (`checkpoints.tar`, 10 GB) vom Google‑Drive‑Link im
+Original‑README laden, dann
+
+```bash
+pip install -r tools/requirements.txt
+python tools/prepare_models.py --checkpoints checkpoints.tar --style chacha --set both --out webxr/models
+```
+
+erzeugt `webxr/models/chacha/…`; `?style=chacha` wählt den Stil. Das Netz ist eine Drop‑in‑ONNX‑
+Datei mit `meta.json`. Für Analysen (Interpretability, Fine‑Tuning‑Daten) gibt es in den
+Einstellungen **„Telemetrie exportieren“**: alle Netz‑Ein‑ und Ausgaben der letzten 2000 Ticks als
+JSON. Referenzimplementierung, Fixtures und Parity‑Tests: `tools/dp_pipeline.py`,
+`tools/gen_fixtures.py`, `tests/unit/pipeline*.test.js`, `tests/net/`.
+
+## Arcade‑Betrieb
+
+- **Installation als App**: Von GitHub Pages (oder einem Server mit vertrauenswürdigem Zertifikat)
+  lässt sich die PWA im Quest‑Browser installieren („Zum Startbildschirm“). Für eine echte APK
+  Meta’s `ovr-platform-util create-pwa` mit `webxr/manifest.webmanifest` verwenden; die Adresse
+  bleibt die Web‑URL, Updates kommen automatisch (Service Worker ist network‑first für die App‑
+  Shell und cacht Modelle/Bibliotheken dauerhaft).
+- **Offline**: Nach dem ersten Start sind App, Modelle und mitgelieferte Tänze gecacht (nur mit
+  vertrauenswürdigem HTTPS). Server‑Funktionen (Upload, Bestenliste, Online‑Duo) brauchen das WLAN.
+- **Server absichern**: `node server/server.js --token <geheim>` schützt schreibende API‑Aufrufe;
+  die Brillen bekommen den Token einmalig über `?token=…` in der URL. Zertifikat, Firewall und
+  Optionen: [`server/README.md`](server/README.md).
+- **Kiosk‑Tipps**: Kalibrierring auf dem Boden markieren (Spieler stehen automatisch richtig);
+  Spielername in den Einstellungen setzen; Bestenliste pro Tanz; Ergebnisse liegen in
+  `server/data/results.json` (CSV‑Export im Ergebnisbildschirm).
+- **Leistung Quest 2**: Szene ist bewusst leicht (kein Schatten, Pixel‑Ratio 1, ein Draw‑Call pro
+  Avatar, HUD‑Texturen nur bei Änderungen), Ziel 72 Hz. Die Netze laufen im Worker, siehe oben.
+- **Bekannte Grenzen**: kein Fuß‑Tracking (Fußarbeit wird aus Kopf/Händen abgeleitet); die C‑Walk‑
+  Referenz ist bis zur Aufnahme im Headset prozedural; Handtracking wird genutzt, wenn aktiv
+  (Handgelenk), aber die Menü‑Bedienung ist auf Controller ausgelegt; Song‑Synchronisation hängt
+  vom korrekten BPM/Offset in der Choreografie ab; Texteingabe in VR ist auf Presets beschränkt.
+
+## Entwicklung
+
+```bash
+npm install                 # Root + server/
+npm test                    # Unit-Tests (node --test): Scoring, Choreos, Pipeline-Parität, Server, Duo
+npm run test:e2e            # Playwright, headless Chromium: Boot, Scoring, Neural-Worker, Aufnahme, Duo
+npm run gen:choreos         # prozedurale Choreografien neu erzeugen
+node tests/net/worker-smoke.mjs   # Inferenz-Worker im Browser messen (optional)
+```
+
+CI (`.github/workflows/ci.yml`) führt Unit‑ und E2E‑Tests aus; `pages.yml` deployt `webxr/`.
+Alles ist ohne Bundler in ES‑Modulen geschrieben (three.js r170 und onnxruntime‑web 1.20.1 sind
+unter `webxr/vendor/` eingebunden), sodass die App auch von einem USB‑Stick‑Server läuft – nur nicht
+direkt von `file://`.
+
+## Roadmap
+
+1. C‑Walk im Headset aufnehmen und als Referenz einchecken; Toleranzen mit echten Spielern kalibrieren.
+2. Quest‑2‑Messung des Neural‑Avatars (Threads via LAN‑Server) und ggf. kleineres Tracking‑Netz.
+3. Nativer Port (Unity 2022.3 + Meta XR + Sentis) auf Basis des vorhandenen `dancing-points-unity`
+   Frameworks, siehe [`docs/NATIVE_PORT.md`](docs/NATIVE_PORT.md).
+4. Partner‑KI‑Modus (Follower‑Netze) für Ballroom‑Stile; Song‑Beat‑Erkennung; Handtracking‑Menü.
+
+## Lizenzen
+
+three.js (MIT), onnxruntime‑web (MIT), ws/selfsigned (MIT). Die vortrainierten Gewichte und der
+Datensatz stammen von den Autoren des Papers *Dancing Points* (Li, Starke, Ye, Sorkine‑Hornung,
+CGF 2026) und sind für Forschungszwecke veröffentlicht – **eine kommerzielle Nutzung der Gewichte
+und Daten muss mit den Autoren geklärt werden; dieses Repository erteilt diese Rechte nicht.**
+Musik ist nicht enthalten.
+
+---
+
+## Original research README (Dancing Points, Python training code)
+
 # Dancing Points: Synthesizing Ballroom Dancing with Three-Point Inputs
 
 ![Python](https://img.shields.io/badge/Python->=3.11-Blue?logo=python)  ![Pytorch](https://img.shields.io/badge/PyTorch->=2.1-Red?logo=pytorch)

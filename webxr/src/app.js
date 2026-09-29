@@ -26,6 +26,8 @@ import { PlayerMirror } from './render/mirror.js';
 import { Menu } from './ui/menu.js';
 import { NeuralAvatarDriver } from './net/avatar-driver.js';
 import { registerDuoModes } from './duo/modes.js';
+import { mergeResults, resultKey } from './duo/benchmark.js';
+import { yawFromQuat, angleDiff } from './util/math.js';
 
 export const STATES = Object.freeze({
   BOOT: 'BOOT',
@@ -52,7 +54,16 @@ const LOCAL_TEXTS = {
     recordAborted: 'Aufnahme abgebrochen',
     ownDance: 'Eigener Tanz',
     fromServer: 'Server',
-    holdToQuit: 'B/Y gedrückt halten zum Abbrechen',
+    holdToQuit: 'B/Y {sec} s gedrückt halten zum Abbrechen',
+    readyHold: 'Bereit? Gleich geht es los …',
+    swFailed: 'Kein Offline-Cache (Zertifikat nicht vertrauenswürdig – siehe server/README.md)',
+    swUpdated: 'Neue Version verfügbar – Seite wird neu geladen …',
+    recentered: 'Ansicht neu zentriert – bitte neu kalibrieren',
+    contextLost: 'Grafik zurückgesetzt – Seite wird neu geladen …',
+    paused: 'Pause – Headset aufsetzen zum Weitermachen',
+    resumed: 'Weiter geht es',
+    neuralProgress: 'Neural-Avatar lädt: {loaded} / {total} MB',
+    neuralDisabledSaved: 'Neural-Avatar deaktiviert (zu langsam) – in den Einstellungen wieder einschaltbar',
     reviewInfo: '{frames} Frames · {seconds} s · {bpm} BPM',
     modeSolo: 'Solo',
     modeGhost: 'Duo (Geist)',
@@ -75,7 +86,16 @@ const LOCAL_TEXTS = {
     recordAborted: 'Recording aborted',
     ownDance: 'My dance',
     fromServer: 'Server',
-    holdToQuit: 'Hold B/Y to quit',
+    holdToQuit: 'Hold B/Y for {sec} s to quit',
+    readyHold: 'Ready? Starting in a moment ...',
+    swFailed: 'No offline cache (certificate not trusted - see server/README.md)',
+    swUpdated: 'New version available - reloading ...',
+    recentered: 'View recentred - please recalibrate',
+    contextLost: 'Graphics reset - reloading ...',
+    paused: 'Paused - put the headset on to continue',
+    resumed: 'Resuming',
+    neuralProgress: 'Neural avatar loading: {loaded} / {total} MB',
+    neuralDisabledSaved: 'Neural avatar disabled (too slow) - re-enable it in the settings',
     reviewInfo: '{frames} frames · {seconds} s · {bpm} BPM',
     modeSolo: 'Solo',
     modeGhost: 'Duo (ghost)',
@@ -96,7 +116,11 @@ const SYNTHS = ['hiphop', 'house', 'metronome'];
 const MAX_RESULTS = 500;
 const MAX_RUNS_PER_CHOREO = 3;
 const CALIBRATION_REUSE_SEC = 600;
-const QUIT_HOLD_SEC = 1.0;
+const CALIBRATION_MAX_YAW_DIFF = 0.55;   // rad (~30 deg): a persisted calibration whose facing differs more is redone
+const QUIT_HOLD_SEC = FLOW.quitHoldSec;
+const QUIT_STATES = new Set([STATES.CALIBRATE, STATES.COUNTDOWN, STATES.PLAYING, STATES.RECORDING]);
+const SERVER_HIGHSCORE_LIMIT = 1000;
+const RESULT_POST_DELAY_MS = 10000;      // online duo: wait this long for the benchmark before uploading the result
 // states in which the neural avatar worker is fed and the player's mirror image is shown
 const NEURAL_STATES = new Set([STATES.CALIBRATE, STATES.COUNTDOWN, STATES.PLAYING, STATES.RESULTS, STATES.RECORDING, STATES.RECORD_REVIEW]);
 const MIRROR_STATES = new Set([STATES.COUNTDOWN, STATES.PLAYING, STATES.RESULTS, STATES.RECORDING, STATES.RECORD_REVIEW]);
@@ -231,6 +255,9 @@ export class App extends EventEmitter {
     this._goHideAt = Infinity;
     this._highscoreIndex = 0;
     this._serverHighscores = null;
+    this._pendingPost = null;         // { json, timer } result upload waiting for the duo benchmark
+    this._swReload = false;           // a new service worker took over: reload when back in the menu
+    this._pausedByXR = false;
     this.frameCount = 0;
     this._frame = this._frame.bind(this);
     this._overlay = null;
@@ -265,12 +292,16 @@ export class App extends EventEmitter {
     this._buildPanels();
     registerDuoModes(this);
     this._bindOverlay();
+    sk.onContextLost = () => this._setStatus(this.local.contextLost);
+    sk.onContextRestored = () => this._reload(this.local.contextLost);
     this._registerServiceWorker();
     this._loadSkeleton();
     this._neuralEnsure();
     sk.setAnimationLoop(this._frame);
     this.setState(STATES.MENU);
     this.menu.show('main');
+    // the VR button does not depend on the network: enable it before the (bounded) probes
+    if (!this.params.emu) await this._probeXR();
     await this._probeServer();
     await this.loadChoreoList();
 
@@ -281,11 +312,31 @@ export class App extends EventEmitter {
       if (this.params.autostart && ref) {
         this.startSolo(ref).catch((e) => this._fail(t.errorChoreoLoad, e));
       }
-    } else {
-      this._probeXR();
     }
     this.emit('boot', this);
     return this;
+  }
+
+  /** fetch with a timeout (a wedged server / captive portal must not block the boot or a run). */
+  _fetch(url, init = {}, ms = FLOW.networkTimeoutMs) {
+    const opts = { ...init };
+    if (!opts.signal && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      try { opts.signal = AbortSignal.timeout(ms); } catch (e) { /* older browsers */ }
+    }
+    return fetch(url, opts);
+  }
+
+  /** Headers of a mutating API call (server/server.js --token). */
+  _apiHeaders(extra = {}) {
+    const h = { ...extra };
+    if (this.settings.apiToken) h['X-Dp-Token'] = this.settings.apiToken;
+    return h;
+  }
+
+  _reload(notice) {
+    if (notice) { this.hud.showNotice(notice, 3); this._setStatus(notice); }
+    const loc = this.win && this.win.location;
+    if (loc && typeof loc.reload === 'function') setTimeout(() => loc.reload(), 300);
   }
 
   _bindOverlay() {
@@ -322,11 +373,35 @@ export class App extends EventEmitter {
     this.xrSupported = ok;
   }
 
+  /**
+   * Register sw.js. Chromium refuses a service worker on an origin whose certificate error was
+   * clicked through (self-signed LAN certificate): the app still runs, but without offline
+   * start / model cache - the operator sees it on the start overlay (details: console).
+   * Updates: sw.js serves the shell network-first, `registration.update()` checks for a new
+   * worker at every boot and a change of controller reloads the page once it is idle.
+   */
   _registerServiceWorker() {
     const nav = this.win ? this.win.navigator : null;
     if (!nav || !('serviceWorker' in nav) || !this.win.location || this.win.location.protocol === 'file:') return;
+    const sw = nav.serviceWorker;
+    const hadController = !!sw.controller;
     try {
-      nav.serviceWorker.register(`./sw.js?v=${encodeURIComponent(APP_VERSION)}`).catch((e) => console.warn('[app] service worker registration failed', e));
+      sw.register(`./sw.js?v=${encodeURIComponent(APP_VERSION)}`)
+        .then((reg) => { if (reg && typeof reg.update === 'function') reg.update().catch(() => null); })
+        .catch((e) => {
+          console.warn('[app] service worker registration failed', e);
+          const cert = /SSL|certificate/i.test(String(e && e.message));
+          this.swError = cert ? 'certificate' : (e && e.message) || 'error';
+          this._setStatus(cert ? this.local.swFailed : `${this.texts.error}: ${this.swError}`);
+        });
+      if (typeof sw.addEventListener === 'function') {
+        sw.addEventListener('controllerchange', () => {
+          if (!hadController) return;   // first install: the page is already the fresh one
+          this._swReload = true;
+          this.hud.showNotice(this.local.swUpdated, 4);
+          if (this.state === STATES.MENU || this.state === STATES.BOOT) this._reload();
+        });
+      }
     } catch (e) {
       console.warn('[app] service worker registration failed', e);
     }
@@ -382,6 +457,8 @@ export class App extends EventEmitter {
     });
     this.xrSession = session;
     this.sceneKit.onSessionEnd = () => this._onXRSessionEnd();
+    this.sceneKit.onReferenceSpaceReset = () => this._onRecenter();
+    this.sceneKit.onVisibilityChange = (v) => this._onXRVisibility(v);
     await this.sceneKit.startXR(session);
     if (this.input && this.input.dispose) this.input.dispose();
     this.input = new XRInput({ session });
@@ -392,6 +469,45 @@ export class App extends EventEmitter {
     this.menu.show('main');
     this.emit('input', this.input);
     return session;
+  }
+
+  /**
+   * The player recentred the view (long press on the Oculus button): 'local-floor' has a new
+   * origin and yaw, so the stored calibration (old W frame) is wrong. Drop it, reset the stage
+   * and leave any run - the next start calibrates again.
+   */
+  _onRecenter() {
+    this.calibration.cancelCapture();
+    this.calibration.clear();
+    this.sceneKit.resetStage();
+    this._applyStageMatrix();
+    const inRun = this.session || (this.recorder && this.recorder.state === 'recording') || this.state === STATES.CALIBRATE;
+    if (inRun) this.abortToMenu();
+    this.hud.showNotice(this.local.recentered, 4);
+    this.emit('recenter', this.calibration.data);
+  }
+
+  /** XR visibility (system menu open, headset doffed): pause the run, resume when visible. */
+  _onXRVisibility(state) {
+    const s = this.session;
+    const running = s && (s.state === 'countdown' || s.state === 'playing');
+    if (state !== 'visible') {
+      if (running && !s.paused) {
+        s.pause();
+        this._pausedByXR = true;
+        if (this._audioLive() && typeof this.audio.pauseTrack === 'function') this.audio.pauseTrack();
+        this.hud.showNotice(this.local.paused, 60);
+      }
+    } else if (this._pausedByXR) {
+      this._pausedByXR = false;
+      if (running && s.paused) {
+        s.resume();
+        if (this._audioLive() && typeof this.audio.resumeTrack === 'function') this.audio.resumeTrack();
+        this.hud.showNotice(this.local.resumed, 2);
+      } else {
+        this.hud.showNotice(null);
+      }
+    }
   }
 
   _onXRSessionEnd() {
@@ -479,6 +595,8 @@ export class App extends EventEmitter {
     this.state = next;
     this.emit('state', { from: this.prevState, to: next });
     this._neuralSync();
+    // a new service worker took over during a run: pick up the new version once idle
+    if (this._swReload && next === STATES.MENU) { this._swReload = false; this._reload(this.local.swUpdated); }
   }
 
   /** The stage transform from the calibration (S -> W incl. height scale). */
@@ -501,10 +619,15 @@ export class App extends EventEmitter {
 
   // ---- choreographies ------------------------------------------------------------------------
 
+  /**
+   * Build the menu list: shipped entries (index.json) + own recordings are shown at once, the
+   * server's entries (uploads, which replace a shipped id) are merged in when its answer arrives
+   * (bounded by the network timeout, so a wedged server never blanks the menu).
+   */
   async loadChoreoList() {
     const list = [];
     try {
-      const res = await fetch('./choreos/index.json', { cache: 'no-cache' });
+      const res = await this._fetch('./choreos/index.json', { cache: 'no-cache' });
       if (res.ok) {
         const j = await res.json();
         for (const e of (j && j.choreos) || []) {
@@ -515,10 +638,18 @@ export class App extends EventEmitter {
     } catch (e) {
       console.warn('[app] choreos/index.json not available', e);
     }
+    const addOwn = () => {
+      for (const j of Recorder.listPersisted(this.storage)) {
+        if (list.some((x) => x.id === j.id)) continue;
+        list.push({ id: j.id, title: j.title, artist: j.artist || '', bpm: j.bpm, durationBeats: j.durationBeats, difficulty: j.difficulty || 2, source: 'own', json: j });
+      }
+    };
+    addOwn();
+    this._publishChoreos(list);
     const base = this.serverHttp;
     if (base) {
       try {
-        const res = await fetch(`${base}/api/choreos`, { cache: 'no-cache' });
+        const res = await this._fetch(`${base}/api/choreos`, { cache: 'no-cache' });
         if (res.ok) {
           const j = await res.json();
           for (const e of (j && j.choreos) || []) {
@@ -527,20 +658,22 @@ export class App extends EventEmitter {
             const url = typeof e.url === 'string' && e.url.startsWith('/') ? `${base}${e.url}` : `${base}/api/choreos/${encodeURIComponent(e.id)}`;
             const existing = list.find((x) => x.id === e.id);
             if (existing) {
-              if (e.source === 'upload') { existing.url = url; existing.source = 'server'; existing.title = e.title || existing.title; }
+              if (e.source === 'upload' && existing.source !== 'own') { existing.url = url; existing.source = 'server'; existing.title = e.title || existing.title; }
               continue;
             }
             list.push({ ...e, source: 'server', url });
           }
+          this.choreoCache.clear();   // an upload may have replaced a shipped/own id
         }
       } catch (e) {
         console.warn('[app] server choreo list not available', e);
       }
+      this._publishChoreos(list);
     }
-    for (const j of Recorder.listPersisted(this.storage)) {
-      if (list.some((x) => x.id === j.id)) continue;
-      list.push({ id: j.id, title: j.title, artist: j.artist || '', bpm: j.bpm, durationBeats: j.durationBeats, difficulty: j.difficulty || 2, source: 'own', json: j });
-    }
+    return list;
+  }
+
+  _publishChoreos(list) {
     this.choreos = list;
     if (!this.selectedChoreoId && list.length > 0) this.selectedChoreoId = list[0].id;
     const main = this.menu.getPanel('main');
@@ -550,7 +683,6 @@ export class App extends EventEmitter {
       main.refresh();
     }
     this.emit('choreos', list);
-    return list;
   }
 
   /** Resolve an id, a URL, a JSON object or a Choreo to a Choreo (cached by id/url). */
@@ -567,7 +699,11 @@ export class App extends EventEmitter {
       const entry = this.choreos.find((e) => e.id === ref);
       if (entry && entry.json) choreo = new Choreo(entry.json);
       else if (entry && entry.url) choreo = await loadChoreo(entry.url);
-      else choreo = await loadChoreo(`./choreos/${ref}.json`);
+      else if (this.serverHttp) {
+        // unknown id (e.g. a duo partner's dance uploaded after this headset booted): the server
+        // serves uploads and shipped files alike under /api/choreos/<id>
+        try { choreo = await loadChoreo(`${this.serverHttp}/api/choreos/${encodeURIComponent(ref)}`); } catch (e) { choreo = await loadChoreo(`./choreos/${ref}.json`); }
+      } else choreo = await loadChoreo(`./choreos/${ref}.json`);
     }
     this.choreoCache.set(ref, choreo);
     this.choreoCache.set(choreo.id, choreo);
@@ -592,6 +728,7 @@ export class App extends EventEmitter {
     const t = this.texts;
     try {
       if (this.session) { this.session.abort(); this._disposeSession(); }
+      this.lastBenchmark = null;      // never attach a previous round's benchmark to this run
       this.menu.hideAll();
       this.hud.setPlayMode(false);
       this.hud.showTitle(this.local.loadingDance);
@@ -667,7 +804,11 @@ export class App extends EventEmitter {
     if (!head.valid) return false;
     if (Math.abs(head.p[1] - c.h0) > 0.10) return false;
     const dx = head.p[0] - c.origin[0], dz = head.p[2] - c.origin[2];
-    return dx * dx + dz * dz < 0.5 * 0.5;
+    if (dx * dx + dz * dz >= 0.5 * 0.5) return false;
+    // facing: after a recentre (or standing on the marker turned around) the saved yaw is wrong
+    const yaw = yawFromQuat(head.q, NaN);
+    if (!Number.isFinite(yaw)) return false;
+    return Math.abs(angleDiff(yaw, c.yaw)) < CALIBRATION_MAX_YAW_DIFF;
   }
 
   _updateCalibrate(time) {
@@ -687,12 +828,9 @@ export class App extends EventEmitter {
       }
       return;
     }
-    if (!c.recalibrate && elapsed > 0.6 && this._calibrationStillValid()) {
-      this.hud.showNotice(this.local.calibrateKept, 2);
-      this._finishCalibrate(true, true);
-      return;
-    }
-    if (input.anyTriggerDown()) {
+    // trigger hold = fresh capture (also overrides a reusable calibration); not while the laser
+    // is on a button of the panel ('Abbrechen' is pressed with the same trigger)
+    if (input.anyTriggerDown() && !this.menu.hovering) {
       if (!c.holding) {
         c.holding = true;
         c.holdSince = time;
@@ -705,10 +843,26 @@ export class App extends EventEmitter {
         c.holding = false;
         this._finishCalibrate(!!data);
       }
-    } else if (c.holding) {
+      return;
+    }
+    if (c.holding) {
       c.holding = false;
       c.progress = 0;
-      this.calibration.endCapture();   // discard the partial capture (keeps the old data if any)
+      this.calibration.cancelCapture();   // a short tap must not install a 1-2 frame average
+    }
+    // reuse of the persisted calibration: announce it, then give the player a moment to lower
+    // the controller and get ready before the count-in starts
+    if (!c.recalibrate && elapsed > 0.6 && this._calibrationStillValid()) {
+      if (!c.keptSince) {
+        c.keptSince = time;
+        this.hud.showNotice(`${this.local.calibrateKept} · ${this.local.readyHold}`, FLOW.calibrationReuseWaitSec + 0.5);
+      }
+      const wait = FLOW.calibrationReuseWaitSec / this.clock.speed;
+      c.progress = Math.min(1, (time - c.keptSince) / 1000 / wait);
+      if (c.progress >= 1) this._finishCalibrate(true, true);
+    } else if (c.keptSince) {
+      c.keptSince = 0;
+      c.progress = 0;
     }
   }
 
@@ -836,14 +990,27 @@ export class App extends EventEmitter {
     this.hud.showTime(Math.max(0, this.choreo.duration - t));
     if (t >= this._goHideAt) { this.hud.showCountdown(null); this._goHideAt = Infinity; }
     if (this.mode && typeof this.mode.update === 'function') this.mode.update(time, dt, s);
-    // hold B/Y (secondary) to quit in XR
-    if (this.inputKind === 'xr') {
-      if (this.input.isDown('any', 'secondary')) {
-        if (!Number.isFinite(this._quitHold)) { this._quitHold = time; this.hud.showNotice(this.local.holdToQuit, 1.2); }
-        else if ((time - this._quitHold) / 1000 >= QUIT_HOLD_SEC) this.abortToMenu();
-      } else {
-        this._quitHold = NaN;
+  }
+
+  /**
+   * Hold B/Y (secondary) for QUIT_HOLD_SEC to leave a run, a recording or the calibration in XR.
+   * A resting thumb presses B/Y easily, hence the long hold with a visible countdown on the
+   * wall notice; releasing resets it.
+   */
+  _updateQuitHold(time) {
+    if (this.inputKind !== 'xr' || !this.input) return;
+    if (this.input.isDown('any', 'secondary')) {
+      if (!Number.isFinite(this._quitHold)) { this._quitHold = time; this._quitShown = -1; }
+      const held = (time - this._quitHold) / 1000;
+      if (held >= QUIT_HOLD_SEC) { this._quitHold = NaN; this.abortToMenu(); return; }
+      const left = Math.ceil(QUIT_HOLD_SEC - held);
+      if (left !== this._quitShown) {
+        this._quitShown = left;
+        this.hud.showNotice(this.local.holdToQuit.replace('{sec}', String(left)), 1.5);
       }
+    } else if (Number.isFinite(this._quitHold)) {
+      this._quitHold = NaN;
+      this.hud.showNotice(null);
     }
   }
 
@@ -876,6 +1043,8 @@ export class App extends EventEmitter {
 
   /** Leave any run / recording and return to the main menu. */
   abortToMenu() {
+    this.calibration.cancelCapture();
+    this._quitHold = NaN;
     if (this.session) this.session.abort();
     if (this.recorder && this.recorder.state === 'recording') {
       this.recorder.cancel();
@@ -958,21 +1127,68 @@ export class App extends EventEmitter {
       const json = resultToJSON(result);
       json.choreoTitle = this.choreo ? this.choreo.title : '';
       const b = this.lastBenchmark;
-      if (b && b.choreoId === result.choreoId && result.mode !== 'solo') {
-        json.benchmark = { mode: b.mode, winner: b.winner, pair: b.pair, partner: b.players[1] ? { name: b.players[1].name, score: b.players[1].score, stars: b.players[1].stars, maxCombo: b.players[1].maxCombo } : null };
-      }
+      if (b && b.choreoId === result.choreoId && result.mode !== 'solo') json.benchmark = compactBenchmark(b);
       arr.push(json);
       if (arr.length > MAX_RESULTS) arr = arr.slice(arr.length - MAX_RESULTS);
       this.storage.setItem(STORAGE_KEYS.results, JSON.stringify(arr));
-      const base = this.serverHttp;
-      if (base) {
-        fetch(`${base}/api/results`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(json) })
-          .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); this.hud.showNotice(this.texts.resultsSaved, 2); })
-          .catch((e) => { console.warn('[app] result upload failed', e); this.hud.showNotice(this.texts.resultsSaveFailed, 3); });
+      this._flushPendingPost();
+      if (result.mode === 'online' && !json.benchmark) {
+        // the partner's result usually arrives a few ms later: upload once the benchmark is
+        // attached (attachBenchmark) or after a bounded wait
+        this._pendingPost = { json, timer: setTimeout(() => this._flushPendingPost(), RESULT_POST_DELAY_MS) };
+      } else {
+        this._postResult(json);
       }
     } catch (e) {
       console.warn('[app] storing the result failed', e);
     }
+  }
+
+  _postResult(json) {
+    const base = this.serverHttp;
+    if (!base) return;
+    this._fetch(`${base}/api/results`, { method: 'POST', headers: this._apiHeaders({ 'content-type': 'application/json' }), body: JSON.stringify(json) }, 8000)
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); this.hud.showNotice(this.texts.resultsSaved, 2); })
+      .catch((e) => { console.warn('[app] result upload failed', e); this.hud.showNotice(this.texts.resultsSaveFailed, 3); });
+  }
+
+  _flushPendingPost() {
+    const p = this._pendingPost;
+    if (!p) return;
+    this._pendingPost = null;
+    clearTimeout(p.timer);
+    this._postResult(p.json);
+  }
+
+  /**
+   * Duo modes: the benchmark became known after the result was stored (the partner's result
+   * arrived late). Update the stored copy and release the pending upload with it.
+   */
+  attachBenchmark(benchmark, result = this.lastResult) {
+    if (!benchmark || !result || benchmark.choreoId !== result.choreoId) return false;
+    this.lastBenchmark = benchmark;
+    const compact = compactBenchmark(benchmark);
+    let updated = false;
+    if (this.storage) {
+      try {
+        const raw = this.storage.getItem(STORAGE_KEYS.results);
+        const arr = raw ? JSON.parse(raw) : [];
+        if (Array.isArray(arr)) {
+          const key = resultKey(result);
+          for (let i = arr.length - 1; i >= 0; i--) {
+            if (arr[i] && resultKey(arr[i]) === key) { arr[i].benchmark = compact; updated = true; break; }
+          }
+          if (updated) this.storage.setItem(STORAGE_KEYS.results, JSON.stringify(arr));
+        }
+      } catch (e) {
+        console.warn('[app] updating the stored benchmark failed', e);
+      }
+    }
+    if (this._pendingPost && resultKey(this._pendingPost.json) === resultKey(result)) {
+      this._pendingPost.json.benchmark = compact;
+      this._flushPendingPost();
+    }
+    return updated;
   }
 
   /** localStorage['dp.runs'] = array of dancing-points-run/1 objects (newest last, 3 per choreo). */
@@ -991,7 +1207,7 @@ export class App extends EventEmitter {
       this.storage.setItem(STORAGE_KEYS.runs, JSON.stringify(arr));
       const base = this.serverHttp;
       if (base) {
-        fetch(`${base}/api/runs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(run) })
+        this._fetch(`${base}/api/runs`, { method: 'POST', headers: this._apiHeaders({ 'content-type': 'application/json' }), body: JSON.stringify(run) }, 15000)
           .catch((e) => console.warn('[app] run upload failed', e));
       }
     } catch (e) {
@@ -1011,12 +1227,18 @@ export class App extends EventEmitter {
     }
   }
 
-  /** Top-n results of a choreography: local + (cached) server results. */
+  /**
+   * Top-n results of a choreography: local + (cached) server results, de-duplicated (every
+   * play of this headset is on the server too; only server-only entries are tagged
+   * `fromServer` = played on another headset).
+   */
   highscores(choreoId, n = 10) {
-    const all = this.localResults().filter((r) => r && r.choreoId === choreoId);
+    const local = this.localResults().filter((r) => r && r.choreoId === choreoId);
+    const server = [];
     if (Array.isArray(this._serverHighscores)) {
-      for (const r of this._serverHighscores) if (r && r.choreoId === choreoId) all.push({ ...r, fromServer: true });
+      for (const r of this._serverHighscores) if (r && r.choreoId === choreoId) server.push({ ...r, fromServer: true });
     }
+    const all = mergeResults(local, server);
     all.sort((a, b) => (b.score - a.score) || (Date.parse(b.playedAt || 0) - Date.parse(a.playedAt || 0)));
     return all.slice(0, n);
   }
@@ -1025,7 +1247,9 @@ export class App extends EventEmitter {
     const base = this.serverHttp;
     if (!base) return;
     try {
-      const res = await fetch(`${base}/api/results`, { cache: 'no-cache' });
+      // the server returns the newest results first (default 100): ask for its maximum so that
+      // an all-time best of a busy day is not pushed out by the afternoon's plays
+      const res = await this._fetch(`${base}/api/results?limit=${SERVER_HIGHSCORE_LIMIT}`, { cache: 'no-cache' }, 8000);
       if (!res.ok) return;
       const j = await res.json();
       const arr = Array.isArray(j) ? j : (j && Array.isArray(j.results) ? j.results : []);
@@ -1181,7 +1405,9 @@ export class App extends EventEmitter {
     let ok = true;
     if (base) {
       try {
-        await Recorder.upload(json, base);
+        const token = this.settings.apiToken;
+        const fetchImpl = token ? (url, init = {}) => fetch(url, { ...init, headers: { ...(init.headers || {}), 'X-Dp-Token': token } }) : undefined;
+        await Recorder.upload(json, base, fetchImpl);
         this.hud.showNotice(t.recordSaved, 3);
       } catch (e) {
         ok = false;
@@ -1225,7 +1451,10 @@ export class App extends EventEmitter {
     if (this.params.avatar) s.avatar = this.params.avatar;
     if (this.params.lang) s.lang = this.params.lang;
     if (this.params.telemetry) s.telemetry = true;
+    if (this.params.token) s.apiToken = this.params.token;   // ?token= once, then persisted per headset
     if (!AVATAR_MODES.includes(s.avatar)) s.avatar = 'neural';
+    // an explicit ?avatar=neural retries even after the guard disabled the network on this headset
+    if (this.params.avatar === 'neural' && this.extra && this.extra.avatarExplicit) s.neuralVerdict = null;
     // the neural avatar is the default on the headset; the desktop/test emulation uses the
     // light point avatar unless ?avatar=neural asks for the network explicitly
     if (this.params.emu && s.avatar === 'neural' && !(this.extra && this.extra.avatarExplicit && this.params.avatar === 'neural')) s.avatar = 'points';
@@ -1243,7 +1472,14 @@ export class App extends EventEmitter {
     if (!AVATAR_MODES.includes(mode)) return;
     this.settings.avatar = mode;
     if (this.playerBody) this.playerBody.visible = mode === 'neural' && this.playerBody.hasPose;
-    if (mode === 'neural') this._neuralEnsure();
+    if (mode === 'neural') {
+      // choosing 'Neural' in the settings is the operator's decision to try the network again
+      if (this.settings.neuralVerdict) {
+        this.settings.neuralVerdict = null;
+        if (this.neural && !this.neural.driver) this.neural = null;
+      }
+      this._neuralEnsure();
+    }
     this._neuralSync();
     if (this.mirror && mode === 'off') this.mirror.visible = false;
     this.saveSettings();
@@ -1273,6 +1509,8 @@ export class App extends EventEmitter {
     for (const m of this.modes.values()) if (m.lobbyPanelId && this.menu.getPanel(m.lobbyPanelId)) also.push(m.lobbyPanelId);
     this.menu.show('duo', also);
     this.emit('lobby', this._modeContext());
+    // dances uploaded by the other headset since boot must be startable here
+    if (this.serverHttp) this.loadChoreoList().catch(() => null);
   }
 
   backToMenu() {
@@ -1353,6 +1591,15 @@ export class App extends EventEmitter {
     const t = this.texts;
     const n = { driver: null, ready: false, info: null, poses: 0, state: 'idle', notice: '', fallback: null, loadMs: 0 };
     this.neural = n;
+    const verdict = this.settings.neuralVerdict;
+    if (verdict && verdict.disabled) {
+      // the guard disabled the network on this headset earlier: do not download and re-test
+      // 85 MB of models on every boot (the settings button 'Neural' clears the verdict)
+      n.fallback = `disabled earlier (${verdict.reason || 'too slow'}${verdict.inferenceMs ? `, ${Math.round(verdict.inferenceMs)} ms` : ''})`;
+      n.state = 'disabled';
+      console.warn('[app] neural avatar skipped: ' + n.fallback);
+      return n;
+    }
     if (typeof Worker === 'undefined') {
       n.fallback = 'no Web Worker support';
       n.state = 'error';
@@ -1403,14 +1650,29 @@ export class App extends EventEmitter {
   _onNeuralStatus(s) {
     const n = this.neural;
     if (!n) return;
-    if (s.progress) return;
+    if (s.progress) {
+      // 35 + 51 MB over arcade WLAN take a while: keep the player informed (throttled to whole MB)
+      const p = s.progress;
+      const mb = (x) => Math.round(x / 1048576);
+      const loaded = mb(p.loaded), total = p.total ? mb(p.total) : 0;
+      if (loaded !== n.progressMb || p.label !== n.progressLabel) {
+        n.progressMb = loaded;
+        n.progressLabel = p.label;
+        const text = this.local.neuralProgress.replace('{loaded}', String(loaded)).replace('{total}', total ? String(total) : '?');
+        this.hud.showNotice(`${text}${p.label ? ` (${p.label})` : ''}`, 2.5);
+      }
+      return;
+    }
     n.state = s.state;
     n.notice = s.notice || '';
     const t = this.texts;
     if (s.state === 'disabled') {
       n.fallback = s.notice || 'disabled';
       console.warn('[app] neural avatar fallback: ' + n.fallback + ` (mean ${s.inferenceMs.toFixed(1)} ms)`);
-      this.hud.showNotice(t.hudNeuralDisabled, 5);
+      // remember the verdict per headset (settings); 'Neural' in the settings clears it
+      this.settings.neuralVerdict = { disabled: true, reason: 'too slow', inferenceMs: s.inferenceMs, at: new Date().toISOString(), version: APP_VERSION };
+      this.saveSettings();
+      this.hud.showNotice(this.local.neuralDisabledSaved, 6);
     } else if (s.state === 'error') {
       n.fallback = n.fallback || s.notice || 'error';
       this.hud.showNotice(t.errorModelLoad, 4);
@@ -1436,8 +1698,8 @@ export class App extends EventEmitter {
 
   /**
    * Decide where the REST API lives: `?server=` wins; otherwise the page's own origin when
-   * `api/info` next to index.html answers (server/server.js serves both). GitHub Pages / a USB
-   * stick have no server: results and runs then stay in localStorage only.
+   * `api/info` next to index.html answers (server/server.js serves both). GitHub Pages has no
+   * server: results and runs then stay in localStorage only. Bounded by FLOW.networkTimeoutMs.
    */
   async _probeServer() {
     const explicit = httpBaseOf(this.params.server);
@@ -1450,7 +1712,7 @@ export class App extends EventEmitter {
     if (!loc || !/^https?:$/.test(loc.protocol) || typeof fetch !== 'function') return null;
     try {
       const url = new URL('api/info', loc.href);
-      const res = await fetch(url.href, { cache: 'no-store' });
+      const res = await this._fetch(url.href, { cache: 'no-store' });
       if (!res.ok) return null;
       const info = await res.json();
       if (!info || typeof info !== 'object' || !('serverVersion' in info)) return null;
@@ -1488,6 +1750,8 @@ export class App extends EventEmitter {
       // neural avatar: 30 Hz resampling + S->DP happen in the driver (wall time keeps it monotonic)
       const nd = this.neural ? this.neural.driver : null;
       if (nd && nd.active && input.sample.head.valid) nd.update(this.playerS, time / 1000);
+      // render-loop guard: only the headset's frame rate matters (the desktop/headless emu is slow anyway)
+      if (nd && nd.active && sk.presenting && dt > 0) nd.reportFrameMs(dt * 1000);
       // 2. camera when not presenting
       if (!sk.presenting) {
         if (this.extra.cam === 'third') sk.setThirdPersonCamera();
@@ -1501,8 +1765,12 @@ export class App extends EventEmitter {
         if (ctrl) this.menu.setPointerFromObject(ctrl.ray, this.pointerHand);
         else if (input.sample[this.pointerHand].valid) this.menu.setPointerFromPose(input.sample[this.pointerHand], this.pointerHand);
         else this.menu.clearPointer();
-        if (this.state !== STATES.CALIBRATE && input.justPressed(this.pointerHand, 'trigger')) this.menu.press();
+        // in CALIBRATE the trigger is the hold-to-calibrate button - unless the laser is on a
+        // button of the panel ('Abbrechen')
+        if ((this.state !== STATES.CALIBRATE || this.menu.hovering) && input.justPressed(this.pointerHand, 'trigger')) this.menu.press();
       }
+      // B/Y hold leaves a run, a recording or the calibration (XR only)
+      if (QUIT_STATES.has(this.state)) this._updateQuitHold(time);
     }
 
     // 4. state
@@ -1802,6 +2070,12 @@ export class App extends EventEmitter {
 
 function gradeColor(grade) {
   return { perfekt: '#4cff9a', gut: '#4cc9f0', ok: '#ffd166', daneben: '#ff6b6b' }[grade] || '#f4f6ff';
+}
+
+/** The part of a duo benchmark stored with a result (localStorage + /api/results). */
+function compactBenchmark(b) {
+  const p = b.players && b.players[1];
+  return { mode: b.mode, winner: b.winner, pair: b.pair, partner: p ? { name: p.name, score: p.score, stars: p.stars, maxCombo: p.maxCombo } : null };
 }
 
 /** localStorage may throw (privacy mode); fall back to an in-memory map. */
