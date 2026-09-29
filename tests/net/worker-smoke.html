@@ -1,0 +1,147 @@
+<!doctype html>
+<!-- worker-smoke.html - browser page for tests/net/worker-smoke.mjs: starts the inference worker
+     through NeuralAvatarDriver with the free models and a synthetic standing person (slight sway),
+     collects poses and timing into window.__smoke. Served from the repository root. -->
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>Dancing Points VR – Worker-Smoke</title>
+  <style>
+    body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; background: #111; color: #eee; }
+    pre { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Neural-Avatar Worker – Smoke-Test</h1>
+  <pre id="log">Starte …</pre>
+  <script type="module">
+    import { NeuralAvatarDriver } from '/webxr/src/net/avatar-driver.js';
+
+    const params = new URLSearchParams(location.search);
+    const wantPoses = Number(params.get('ticks') || 60);
+    const timeoutMs = Number(params.get('timeout') || 120000);
+    const fps = Number(params.get('fps') || 72);
+    const modelsUrl = params.get('models') || '/webxr/models/free/';
+    const ortUrl = params.get('ortUrl') || null; // e.g. a bogus URL to exercise the classic-bundle fallback
+    const numThreads = Number(params.get('threads') || 1); // > 1 needs cross-origin isolation (COOP/COEP)
+    const logEl = document.getElementById('log');
+    const lines = [];
+    const log = (s) => { lines.push(s); logEl.textContent = lines.slice(-40).join('\n'); console.log('[smoke] ' + s); };
+
+    const smoke = window.__smoke = {
+      done: false, error: null, info: null, status: [], poses: [], frames: 0,
+      timing: null, driverState: null, pipelineCheck: null,
+    };
+
+    let skeleton = null;
+    try {
+      skeleton = await (await fetch(modelsUrl + 'skeleton.json')).json();
+    } catch (e) {
+      smoke.error = 'skeleton.json: ' + e.message; smoke.done = true; throw e;
+    }
+
+    const inputHead = [0, 1.62, 0];
+    smoke.crossOriginIsolated = !!self.crossOriginIsolated;
+    const driver = new NeuralAvatarDriver({
+      modelsUrl,
+      ortUrl,
+      numThreads,
+      telemetry: true,
+      telemetryTicks: 100,
+      onStatus: (s) => { smoke.status.push({ state: s.state, notice: s.notice, progress: s.progress ? [s.progress.label, s.progress.loaded, s.progress.total] : null }); if (!s.progress) log('status: ' + s.state + ' ' + (s.notice || '')); },
+      onError: (e) => { log('error: ' + e.message); smoke.error = e.message; },
+      onPose: (p) => {
+        const pos = p.positionsWorldS;
+        let finite = true;
+        for (let i = 0; i < pos.length; i++) if (!Number.isFinite(pos[i])) { finite = false; break; }
+        // bone lengths in S (distances are frame independent)
+        let maxRatio = 0;
+        let maxBone = -1;
+        for (let j = 1; j < skeleton.parents.length; j++) {
+          const q = skeleton.parents[j];
+          const len = skeleton.boneLengths[j];
+          if (len < 0.01) continue;
+          const d = Math.hypot(pos[j * 3] - pos[q * 3], pos[j * 3 + 1] - pos[q * 3 + 1], pos[j * 3 + 2] - pos[q * 3 + 2]);
+          const r = d / len;
+          if (r > maxRatio) { maxRatio = r; maxBone = j; }
+        }
+        const head = 27;
+        smoke.poses.push({
+          tick: p.tick, t: p.t, finite, maxBoneRatio: maxRatio, maxBone: skeleton.joints[maxBone],
+          headS: [pos[head * 3], pos[head * 3 + 1], pos[head * 3 + 2]],
+          rootS: Array.from(p.rootS), rootYawS: p.rootYawS,
+          inferenceMs: p.inferenceMs, mappingMs: p.mappingMs, trackingMs: p.trackingMs,
+          contacts: Array.from(p.contacts),
+        });
+        if (smoke.poses.length % 10 === 0) log('pose ' + smoke.poses.length + ': ' + p.inferenceMs.toFixed(1) + ' ms (map ' + p.mappingMs.toFixed(1) + ' + track ' + p.trackingMs.toFixed(1) + ') head y ' + pos[head * 3 + 1].toFixed(3));
+      },
+    });
+
+    try {
+      const t0 = performance.now();
+      smoke.info = await driver.init();
+      smoke.info.initWallMs = performance.now() - t0;
+      log('ready after ' + smoke.info.initWallMs.toFixed(0) + ' ms; ort ' + smoke.info.ortVersion + ' from ' + smoke.info.ortSource + '; warm-up map ' + smoke.info.warmupMs.mapping.toFixed(1) + ' ms, track ' + smoke.info.warmupMs.tracking.toFixed(1) + ' ms');
+    } catch (e) {
+      smoke.error = 'init failed: ' + e.message;
+      smoke.done = true;
+      log(smoke.error);
+      throw e;
+    }
+
+    driver.start();
+    // synthetic standing person with slight sway, fed at `fps` Hz with game time t
+    const sample = {
+      t: 0, k: 1,
+      head: { p: [0, 1.62, 0], q: [0, 0, 0, 1], valid: true },
+      left: { p: [-0.25, 1.0, -0.12], q: [0, 0, 0, 1], valid: true },
+      right: { p: [0.25, 1.0, -0.12], q: [0, 0, 0, 1], valid: true },
+    };
+    const start = performance.now();
+    const timer = setInterval(() => {
+      const t = (performance.now() - start) / 1000;
+      const yaw = 0.08 * Math.sin(0.9 * t);
+      sample.t = t;
+      sample.head.p[0] = 0.04 * Math.sin(0.7 * t);
+      sample.head.p[1] = 1.62 + 0.012 * Math.sin(1.9 * t);
+      sample.head.p[2] = 0.02 * Math.sin(0.5 * t);
+      sample.head.q[1] = Math.sin(yaw / 2);
+      sample.head.q[3] = Math.cos(yaw / 2);
+      sample.left.p[0] = -0.25 + 0.03 * Math.sin(1.1 * t);
+      sample.left.p[1] = 1.0 + 0.04 * Math.sin(1.3 * t);
+      sample.right.p[0] = 0.25 + 0.03 * Math.sin(1.2 * t + 1);
+      sample.right.p[1] = 1.0 + 0.04 * Math.sin(1.4 * t + 2);
+      driver.update(sample);
+      smoke.frames = driver.stats.frames;
+      driver.getPose();
+      const elapsed = performance.now() - start;
+      if (smoke.poses.length >= wantPoses || elapsed > timeoutMs || driver.state === 'disabled' || driver.state === 'error') {
+        clearInterval(timer);
+        finish(elapsed);
+      }
+    }, 1000 / fps);
+
+    async function finish(elapsedMs) {
+      const ms = smoke.poses.map((p) => p.inferenceMs).sort((a, b) => a - b);
+      const mean = (a) => a.reduce((s, v) => s + v, 0) / Math.max(1, a.length);
+      smoke.timing = ms.length ? {
+        n: ms.length, meanMs: mean(ms), medianMs: ms[Math.floor(ms.length / 2)], minMs: ms[0], maxMs: ms[ms.length - 1],
+        meanMappingMs: mean(smoke.poses.map((p) => p.mappingMs)), meanTrackingMs: mean(smoke.poses.map((p) => p.trackingMs)),
+        elapsedMs, framesPosted: driver.stats.frames, dropped: driver.stats.dropped, posesPerSec: 1000 * ms.length / elapsedMs,
+        inferEvery: driver.inferEvery, poseIntervalMs: driver.poseIntervalMs,
+      } : { n: 0, elapsedMs };
+      smoke.driverState = driver.state;
+      try {
+        const tele = await driver.exportTelemetry();
+        smoke.telemetryTicks = tele.ticks.length;
+      } catch (e) {
+        smoke.telemetryTicks = -1;
+      }
+      log('done: ' + JSON.stringify(smoke.timing));
+      smoke.done = true;
+      driver.dispose();
+    }
+  </script>
+</body>
+</html>

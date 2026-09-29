@@ -1,0 +1,31 @@
+{
+  "choreos": [
+    {
+      "id": "snoop-cwalk",
+      "title": "Snoop Dogg C-Walk – 6 Basic Combos",
+      "artist": "nach Electro Breakers (TikTok)",
+      "bpm": 90,
+      "durationBeats": 48,
+      "difficulty": 2,
+      "file": "snoop-cwalk.json"
+    },
+    {
+      "id": "tutorial-basics",
+      "title": "Tutorial: Grundschritte",
+      "artist": "Dancing Points VR",
+      "bpm": 80,
+      "durationBeats": 32,
+      "difficulty": 1,
+      "file": "tutorial-basics.json"
+    },
+    {
+      "id": "mocap-freestyle",
+      "title": "Freestyle (Mocap-Demo)",
+      "artist": "Dancing Points Datensatz",
+      "bpm": 100,
+      "durationBeats": 50,
+      "difficulty": 3,
+      "file": "mocap-freestyle.json"
+    }
+  ]
+}
