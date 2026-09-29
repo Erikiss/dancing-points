@@ -1,0 +1,122 @@
+{
+ "format": "dancing-points-models/1",
+ "style": "free",
+ "character": "Blueman-simplified",
+ "fps": 30,
+ "models": {
+  "mapping_leader": {
+   "file": "mapping_leader.int8.onnx",
+   "quantization": "int8-dynamic",
+   "metadata": {
+    "window_size": "45",
+    "n_frame_leader_input": "15",
+    "n_frame_follower_input": "0",
+    "n_frame_follower_output": "30",
+    "follower_output_offset": "15",
+    "fps": "30",
+    "use_relative_root_motion": "1",
+    "use_delta_root_motion": "0",
+    "no_root_derivative": "1",
+    "input_joints": "b_head,b_r_wrist,b_l_wrist",
+    "reference_char": "0",
+    "all_input_in_transformed_coordinate": "0",
+    "apply_3pt_input": "1",
+    "apply_3pt_output": "1",
+    "follower_autoregressive": "0"
+   },
+   "inputs": [
+    {
+     "name": "input_leader_Positions",
+     "dim": 135
+    },
+    {
+     "name": "input_leader_RootMotion",
+     "dim": 60
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Positions",
+     "dim": 270
+    },
+    {
+     "name": "RootMotion",
+     "dim": 120
+    }
+   ]
+  },
+  "tracking_leader": {
+   "file": "tracking_leader.int8.onnx",
+   "quantization": "int8-dynamic",
+   "metadata": {
+    "window_size": "31",
+    "n_frame_leader_input": "31",
+    "n_frame_follower_input": "1",
+    "n_frame_follower_output": "30",
+    "follower_output_offset": "1",
+    "fps": "30",
+    "use_relative_root_motion": "1",
+    "use_delta_root_motion": "0",
+    "no_root_derivative": "1",
+    "input_joints": "b_head,b_r_wrist,b_l_wrist",
+    "reference_char": "1",
+    "all_input_in_transformed_coordinate": "0",
+    "apply_3pt_input": "1",
+    "apply_3pt_output": "0",
+    "use_future": "1"
+   },
+   "inputs": [
+    {
+     "name": "input_leader_Positions",
+     "dim": 279
+    },
+    {
+     "name": "input_leader_RootMotion",
+     "dim": 124
+    },
+    {
+     "name": "input_follower_VelocitiesV2",
+     "dim": 102
+    },
+    {
+     "name": "input_follower_Positions",
+     "dim": 102
+    },
+    {
+     "name": "input_follower_Rotations",
+     "dim": 306
+    },
+    {
+     "name": "input_follower_FootContactLabels",
+     "dim": 4
+    },
+    {
+     "name": "input_follower_RootMotion",
+     "dim": 4
+    }
+   ],
+   "outputs": [
+    {
+     "name": "VelocitiesV2",
+     "dim": 3060
+    },
+    {
+     "name": "Positions",
+     "dim": 3060
+    },
+    {
+     "name": "Rotations",
+     "dim": 9180
+    },
+    {
+     "name": "FootContactLabels",
+     "dim": 120
+    },
+    {
+     "name": "RootMotion",
+     "dim": 120
+    }
+   ]
+  }
+ }
+}
