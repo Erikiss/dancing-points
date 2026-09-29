@@ -1,0 +1,4 @@
+# Python >= 3.11 dependencies for tools/*.py (no PyTorch needed)
+numpy>=1.26
+onnx>=1.15
+onnxruntime>=1.17

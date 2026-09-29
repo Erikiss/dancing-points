@@ -1,0 +1,37 @@
+# ci.yml - unit tests (node --test) on every push/PR, then the headless Chromium e2e smoke test.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests (Node 22)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Python tools compile
+        run: python3 -m py_compile tools/dp_pipeline.py tools/prepare_models.py tools/gen_fixtures.py tools/precompute_teacher.py
+
+  e2e:
+    name: E2E smoke test (headless Chromium)
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # playwright-core ships the same CLI as `playwright`; using it keeps the browser revision in
+      # sync with the pinned playwright-core version
+      - run: npx playwright-core install --with-deps chromium
+      - run: npm run test:e2e
