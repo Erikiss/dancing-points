@@ -6,12 +6,18 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/unit/*.test.js",
-    "test:e2e": "node tests/e2e/run.js",
+    "test:e2e": "node --test tests/e2e/*.test.js",
+    "test:all": "npm test && npm run test:e2e",
     "start": "node server/server.js --http",
-    "gen:choreos": "node tools/gen_choreos.js"
+    "start:http": "node server/server.js --http --no-https",
+    "gen:choreos": "node tools/gen_choreos.js",
+    "postinstall": "cd server && npm install --no-audit --no-fund"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "playwright-core": "1.63.0"
   },
   "license": "MIT"
 }

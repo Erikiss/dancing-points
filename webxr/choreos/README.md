@@ -66,7 +66,14 @@ Datei gültig ist, prüft `node --test tests/unit/choreos-files.test.js` bzw. `v
 in `webxr/src/game/choreo.js`.
 
 Optional kann `tools/precompute_teacher.py` aus den drei Punkten mit dem Tracking-Netz
-Ganzkörperdaten (`fullBody`) berechnen, damit der Vortänzer als ganze Figur erscheint.
+Ganzkörperdaten (`fullBody`) berechnen, damit der Vortänzer als ganze Figur erscheint. Die
+mitgelieferten Tänze `snoop-cwalk` und `tutorial-basics` enthalten diesen Block bereits
+(`python3 tools/precompute_teacher.py --choreo webxr/choreos/<id>.json --models webxr/models/free
+--net-scale 1.1553 --out webxr/choreos/<id>.json`; der Netz-Maßstab 1,1553 = 1,70 m / Kopfhöhe
+der Datensatz-Figur). `node tools/gen_choreos.js` behält einen vorhandenen `fullBody` beim
+Neuerzeugen bei, solange die Frame-Zahl gleich bleibt; nach einer Änderung der Bewegungen den
+Block also neu berechnen. Für eigene Aufnahmen ist er optional (ohne ihn tanzt der Vortänzer als
+drei Punkte).
 
 ### Wo die Dateien hingehören
 

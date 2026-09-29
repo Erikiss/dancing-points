@@ -110,3 +110,9 @@ venv.bak/
 .vscode/
 .idea/
 .nosync
+
+# Dancing Points VR (webxr / server / tests)
+node_modules/
+server/data/
+tests/.tmp/
+.playwright/

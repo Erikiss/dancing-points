@@ -1,0 +1,20 @@
+{
+  "name": "dancing-points-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LAN server for Dancing Points VR: HTTPS/HTTP static hosting, REST (choreos, results, runs) and the duo-mode WebSocket relay",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:http": "node server.js --http --no-https"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

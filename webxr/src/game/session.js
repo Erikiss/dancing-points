@@ -84,7 +84,10 @@ export class PlaySession extends EventEmitter {
     this.scorer.onBeat = (ev) => this._onBeatGraded(ev);
   }
 
-  /** Start the count-in now. opts: { speed } (clock speed factor, tests). */
+  /**
+   * Start the count-in now. opts: { speed } (clock speed factor, tests), { startAt } (clock
+   * source time at which the count-in begins, e.g. the synchronised online-duo start).
+   */
   start(opts = {}) {
     const c = this.choreo;
     this.scorer.reset();
@@ -103,7 +106,7 @@ export class PlaySession extends EventEmitter {
     this.score = 0;
     if (this.run) { this.run.filled.fill(0); this.run.lastIndex = -1; }
     this.startedAt = new Date().toISOString();
-    this.clock.start(c.bpm, c.countInBeats, { speed: opts.speed, beatsPerBar: c.beatsPerBar });
+    this.clock.start(c.bpm, c.countInBeats, { speed: opts.speed, beatsPerBar: c.beatsPerBar, startAt: opts.startAt });
     if (this.audio) {
       this.audio.start(this.clock, {
         synth: c.audio.synth,

@@ -685,8 +685,9 @@ export function writeChoreos(outDir, { only = null, index = true } = {}) {
   const entries = [];
   for (const def of defs) {
     const json = buildChoreo(def);
-    const text = serializeChoreo(json);
     const file = path.join(outDir, `${json.id}.json`);
+    carryOverFullBody(json, file);
+    const text = serializeChoreo(json);
     fs.writeFileSync(file, text, 'utf8');
     entries.push(indexEntry(json));
     report.push({ id: json.id, file, frames: json.frames.head.length, bytes: Buffer.byteLength(text, 'utf8') });
@@ -698,6 +699,43 @@ export function writeChoreos(outDir, { only = null, index = true } = {}) {
     report.push({ id: 'index', file, frames: 0, bytes: Buffer.byteLength(text, 'utf8') });
   }
   return report;
+}
+
+/**
+ * The generator only knows the three tracked points; the full-body teacher (`fullBody`) is added
+ * afterwards by tools/precompute_teacher.py (tracking network). Regenerating a file must not
+ * drop that block, so an existing output file's `fullBody` + `meta.fullBodySource/fullBodyParams`
+ * are kept when its frame count still matches. Returns true when something was carried over.
+ */
+export function carryOverFullBody(json, file) {
+  let old;
+  try {
+    old = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    return false;
+  }
+  const fb = old && old.fullBody;
+  if (!fb || typeof fb.positions !== 'string' || !Array.isArray(fb.joints) || !Array.isArray(fb.parents)) return false;
+  const frames = json.frames.head.length;
+  const bytes = Math.floor(fb.positions.replace(/=+$/, '').length * 3 / 4);
+  if (bytes !== frames * fb.joints.length * 3 * 4) return false;
+  json.fullBody = fb;
+  json.meta = json.meta || {};
+  if (old.meta && old.meta.fullBodySource !== undefined) json.meta.fullBodySource = old.meta.fullBodySource;
+  if (old.meta && old.meta.fullBodyParams !== undefined) json.meta.fullBodyParams = old.meta.fullBodyParams;
+  return true;
+}
+
+/** A copy of a choreography without the precomputed full body (for comparisons). */
+export function stripFullBody(json) {
+  const out = { ...json };
+  delete out.fullBody;
+  if (out.meta) {
+    out.meta = { ...out.meta };
+    delete out.meta.fullBodySource;
+    delete out.meta.fullBodyParams;
+  }
+  return out;
 }
 
 export const DEFAULT_OUT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'webxr', 'choreos');

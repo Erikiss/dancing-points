@@ -987,3 +987,502 @@ decoded mapping world 0.45 cm, post‑processed tracking world 0.22–0.50 cm; 5
 tick natively. **Recommendation for `server/server.js`**: send `Cross-Origin-Opener-Policy:
 same-origin` and `Cross-Origin-Embedder-Policy: require-corp` so the Quest Browser can use WASM
 threads (all app resources are same‑origin); without them the worker runs single‑threaded.
+
+## Appendix: presentation API
+
+Lane *game-presentation*: `webxr/index.html`, `manifest.webmanifest`, `sw.js`, `assets/icon*`,
+`src/app.js`, `src/render/{scene,avatar,hud}.js`, `src/ui/menu.js`, `tests/e2e/README.md`.
+These modules import `three` (import map in `index.html`) and are exercised only in the browser
+(headless Chromium smoke test, see `tests/e2e/README.md`). Verified headless: exact playback
+scores `snoop-cwalk` 100, `tutorial-basics` 100, `mocap-freestyle` 99 (BodyAvatar path),
+`noise=0.35` → 1; no console errors; the menu works with mouse + keyboard; the record flow
+produces a valid 61-frame dance; the service worker serves the shell offline.
+
+### `src/app.js` — `App` (extends `EventEmitter`), `STATES`, `parseExtraParams`, `mirroredChoreoView`
+
+Auto-boots in the browser (`window.__dp = { app, version }`; set `window.__dpNoAutoBoot = true`
+before importing to construct it yourself: `new App({ params, storage, document, window })`).
+`STATES = { BOOT, MENU, SETTINGS, CALIBRATE, COUNTDOWN, PLAYING, RESULTS, RECORD_SETUP,
+RECORDING, RECORD_REVIEW, DUO_LOBBY }` (strings, §4). Public surface:
+
+```
+state, prevState, version, params, texts, local (extra strings), settings {avatar, volume, lang, playerName, telemetry}
+sceneKit, menu, hud, teacher (TeacherAvatar at S (0,0,-teacherDistance)), markers (ControllerMarkers, W),
+playerBody (BodyAvatar | null), skeleton (models/<style>/skeleton.json, loaded at boot)
+input, inputKind 'xr'|'desktop'|'playback', xrSession, calibration, audioCtx, audio (AudioEngine), clock (BeatClock)
+choreos [{id,title,artist,bpm,durationBeats,difficulty,source:'shipped'|'server'|'own', url?|json?}], selectedChoreoId, selectedEntry
+choreo (current Choreo), session (PlaySession | null), scorer, recorder, lastResult, lastRun (run JSON), playerS (stage-frame sample, every frame)
+modes Map, modeName, mode, bodyPoseProvider, telemetryExporter, frameCount
+
+boot() → Promise<App>; enterVR() → Promise<XRSession> (user gesture); enterEmu('desktop'|'playback')
+loadChoreoList() → entries (index.json + `${server}/api/choreos` + Recorder.listPersisted); loadChoreoRef(idOrUrlOrJsonOrChoreo) → Promise<Choreo> (cached)
+startSolo(choreoRef, {mode='solo', recalibrate, player}) → Promise<Choreo> (resolves when CALIBRATE is entered)
+startMode(name, choreoRef?, opts?)  (= startSolo with mode); playAgain(); abortToMenu(); backToMenu()
+openSettings(); openHighscores(); openDuoLobby(); startRecordSetup(); beginRecording(); saveRecording() → Promise<bool>; discardRecording()
+setAvatarMode('neural'|'points'|'off'); setVolume(0..1); saveSettings(); exportTelemetry()
+localResults() → dp.results array; highscores(choreoId, n=10) → sorted results (local + cached server)
+registerMode(name, mode); setBodyAvatarPoseProvider(fn, skeleton?) → BodyAvatar|null; setTelemetryExporter(fn)
+```
+
+Events (`app.on(type, fn)`): `'boot'`, `'input'` (backend replaced), `'state' {from, to}`,
+`'choreos'`, `'calibrated'` (data), `'session'` (PlaySession created + started), `'result'`,
+`'recording'` (Recorder), `'recorded'` (json), `'saved'` (json), `'lobby'` (ctx), `'mode'`,
+`'settings'`, `'frame' (timeMs, dtSec)` (every render frame, after the state update).
+
+**Main loop** (`_frame(time, xrFrame)` via `renderer.setAnimationLoop`): input update (`XRInput.update(frame,
+refSpace, session, time)` / `EmulatedInput.update(time)`) → `calibration.toStage(sample, choreo.referenceHeight,
+app.playerS)` → camera from the head pose when not presenting (`?cam=third` = third-person) → menu pointer
+(XR: laser from `sceneKit.controllers[hand].ray`, the hand that last pressed its trigger; trigger =
+`menu.press()`) → state update → body-pose provider → `menu.update()`, `hud.update(dt)` → render.
+
+**Calibration** (state CALIBRATE, `_enterCalibrate({then:'play'|'record'|'menu', recalibrate})`): XR = hold any
+trigger for `FLOW.calibrationHoldSec` (averaged capture); a persisted calibration younger than 10 min whose
+`h0` is within 10 cm of the current head height and whose origin is within 0.5 m is reused after 0.6 s
+("Kalibrierung übernommen") unless `recalibrate`; emu = automatic after `FLOW.calibrationEmuSec / speed`.
+Afterwards `sceneKit.setStageMatrix(calibration.stageToWorldMatrix(m16, choreo.referenceHeight))` — every
+S-frame object (teacher, HUD, menu, ghost/duo avatars, player body) lives under `sceneKit.stage`.
+
+**Playback determinism**: with `emu=playback` the App owns a virtual time source (`app._virtual.source`)
+for `app.clock` and advances it in `_updatePlay` in sub-steps ≤ one scoring tick (`PlaySession.scoreHz`)
+per render frame, so scoring runs at the full 30 Hz whatever the frame rate; the backend gets
+`mirroredChoreoView(choreo)` (a `{referenceHeight, sampleAt}` view returning `mirrorChoreoSample` for
+`mirror: true`, so the ideal player performs what the scorer expects). Audio is disabled in playback mode.
+
+**Persistence**: `localStorage['dp.results']` = JSON array of `resultToJSON(result) + {choreoTitle}` (max
+500, POSTed to `${httpBase}/api/results`); `localStorage['dp.runs']` = JSON array of
+`dancing-points-run/1` objects (newest last, max 3 per `choreoId`, POSTed to `/api/runs`) — **the ghost duo
+reads this**; `dp.settings`, `dp.calibration` (Calibration), `dp.choreos` (Recorder map). `params.server`
+(`wss://` or `https://`) is turned into the REST base by replacing `ws` → `http`.
+
+**Mode interface** (duo lane; `app.registerMode('ghost' | 'online', mode)`; the "Duo-Modus" panel enables
+its buttons when a mode is registered; `mode.lobbyPanelId` names a menu panel shown alongside the duo panel
+in DUO_LOBBY):
+
+```
+mode = {
+  init(app)?,                            // once at registration
+  lobbyPanelId?,                         // menu panel id to show in the lobby (menu.addPanel first)
+  async prepare(ctx)?,                   // after the choreo is loaded, before CALIBRATE (throw → notice + MENU)
+  onSessionCreated(session, ctx)?,       // PlaySession built, not yet started: attach listeners / avatars
+  update(timeMs, dtSec, session)?,       // every frame in COUNTDOWN/PLAYING
+  onFinished(result, ctx) → { lines: string[], moveLines: string[] } | null,   // extra rows on the results panels
+  exit(ctx)?,                            // leaving the run (results → menu, abort)
+}
+ctx = { app, choreo, calibration, sceneKit, stage, menu, hud, texts, teacher, input, clock, storage, server, httpBase }
+```
+`PlaySession.mode` is the mode name; the second dancer belongs at
+`stage` position `(STAGE.duoSideOffset, 0, -STAGE.teacherDistance)` (e.g. `new PointAvatar({color:
+AVATAR_COLORS.ghost, opacity: 0.6})`, `setSample(sampleS)` per frame; a `BodyAvatar` for full-body runs).
+
+**Neural avatar hook**: `app.setBodyAvatarPoseProvider((timeMs, playerS, app) => Float32Array(34*3) | null,
+skeleton?)` renders the player's body (translucent `BodyAvatar` under `stage`, stage-frame positions)
+whenever the provider returns a pose and `settings.avatar === 'neural'`; `app.playerS` is the current
+stage-frame sample for the driver's input; `app.setTelemetryExporter(fn)` backs "Telemetrie exportieren"
+(return `false` when nothing was recorded → HUD notice).
+
+Extra URL parameters parsed by `parseExtraParams(location.search)`: `cam=third`, `height=<m>`,
+`yaw=<rad>` (virtual playback player), and `choreo=<URL>` (config.parseParams rejects URLs, the App
+accepts absolute/relative URLs ending in `.json` or containing `/`).
+
+### `src/render/scene.js` — `SceneKit`, `SCENE_COLORS`, `makeGridTexture`
+
+```
+new SceneKit({ container=document.body, canvas?, xr=true, pixelRatio=1, floorSize, teacherDistance })
+renderer (WebGLRenderer: xr.enabled, 'local-floor', foveation 1, framebuffer scale 1, pixel ratio 1, no shadows)
+scene, camera (PerspectiveCamera 70°, 0.05–80 m), stage (Group, matrixAutoUpdate=false, S→W), sky, floor, marker,
+platform (2.4×0.06×1.6 m at S z=-teacherDistance), screen (wall 4.4×2.6 m at z = screenZ = -(teacherDistance+0.7)),
+screenWidth, screenHeight, screenZ, hemi/key/fill lights, controllers {left|right: {ray, grip, source, index, hand} | null}
+setStageMatrix(array16); resetStage(); setMarkerHighlight(on, phase); setAnimationLoop(fn); render();
+startXR(session) → Promise<XRReferenceSpace> (onSessionEnd callback); endXR(); referenceSpace; presenting;
+resize(); setCameraFromPose({p, q}); setThirdPersonCamera(); dispose()
+```
+
+### `src/render/avatar.js` — `PointAvatar`, `BodyAvatar`, `TeacherAvatar`, `ControllerMarkers`, `AVATAR_COLORS`
+
+* `new PointAvatar({color, opacity=1, headRadius=0.12, handRadius=0.055, lines=true, mirror=false, showNose=true})`
+  (Group): `setSample({head:{p,q}, left:{p}, right:{p}})` in the parent's frame (no allocation), `mirror`
+  property (x → −x, hands swapped, yaw mirrored), `setColor`, `setOpacity`, `dispose`.
+* `new BodyAvatar({skeleton: {joints, parents, boneLengths?}, color, opacity=1, radiusScale=1, headSphere=true})`:
+  one `InstancedMesh` of unit cylinders (one draw call, bones with parent; skeleton bones < 1.5 cm skipped)
+  + a head sphere between `b_head` and `b_head_null`; `setPose(Float32Array jointCount*3)` (parent frame),
+  `hasPose`, `bones`, `setColor`, `setOpacity`, `dispose`. Works with the 34-joint `skeleton.json` and with
+  a choreo's `fullBody.joints/parents`.
+* `new TeacherAvatar({color, opacity, mode:'auto'|'points'})`: `setChoreo(choreo)` (BodyAvatar when
+  `choreo.hasFullBody`, else PointAvatar; `mirror: true` → rotated 180° to face the player), `setMode`,
+  `usesBody`, `update(t, refSample?)` (uses `choreo.fullBodyAt(t)` or the sample), `setColor/Opacity`.
+* `new ControllerMarkers({color, opacity, radius=0.035})`: `setSample(sampleW, showHead=false)`.
+* `AVATAR_COLORS = { teacher 0x4cc9f0, player 0xffd166, ghost 0xb388ff, opponent 0xff6b6b }`.
+
+### `src/render/hud.js` — `HUD`, `TextPanel`, helpers
+
+`new TextPanel({width, height (m), pxPerMeter=320, background, border, rounded})` (Mesh with a
+`CanvasTexture`): `draw((ctx, w, h) => …, key)` redraws only when `key` changes, `invalidate()`,
+`setOpacity`, `dispose`. Helpers: `roundRect`, `fitText(ctx, text, x, y, maxWidth, size, weight, align,
+color)`, `starsString(n)`, `formatTime(sec)`, `HUD_COLORS`, `FONT`.
+`new HUD({texts, screenWidth, screenHeight})` (Group placed at `(0, 0, sceneKit.screenZ)` under `stage`):
+panels `scorePanel`, `titlePanel`, `timePanel` (top row), `movePanel` (above the teacher's head),
+progress bar (top edge), `countdownPanel` (left of the teacher), `gradePanel` (right, animated),
+`noticePanel` (bottom). Setters compare with the last value (cheap per frame): `showScore(score, combo)`,
+`showMove(current, next, hint)`, `showTitle(text|null)`, `showTime(secondsLeft)`, `showProgress(0..1)`,
+`showCountdown(n | 'go' | null)`, `showGrade(grade, combo)`, `showNotice(text, seconds)`, `setPlayMode(on)`,
+`reset()`, `update(dt)`; extra panels for other lanes: `addPanel(id, {width, height, position, background,
+border}) → TextPanel`, `getPanel(id)`, `removePanel(id)`.
+
+### `src/ui/menu.js` — `Menu`, `MenuPanel`, `MENU_COLORS`, `DEFAULT_PPM`
+
+`new Menu({texts, camera, app, pxPerMeter=640})` (Group; the App places it at S `(0, 0, -1.9)` under
+`stage`; add `menu.laser` and `menu.reticle` to the scene):
+
+```
+addPanel(id, spec) → MenuPanel; setPanel(id, spec); removePanel(id); getPanel(id); show(id, alongsideIds?);
+showAlso(id); hidePanel(id); hideAll(); refresh(id?); activeId; active
+setPointer(originV3, dirV3, hand); setPointerFromObject(obj3d, hand) (−Z of its world matrix, e.g. the XR
+controller ray); setPointerFromPose({p,q}, hand); clearPointer(); setMouse(ndcX, ndcY); press() → bool;
+activateFocused(); back(); handleKey(code) → bool (arrows, Enter, Escape/Backspace, Digit1-9); update()
+(raycast, hover, laser, redraw dirty panels); on('action', ({panelId, itemId, item, option?, step?}) => …)
+```
+Panel spec: `{ title, width=1.6 (m), position=[x,y,z], rotationY, items | () => items, footer, onBack(app),
+persistent, minHeight, background, pxPerMeter }`. Items (`text`, `value`, `options`, `items`, `disabled`
+may be functions of the app): `label {text, size:'small'|'normal'|'large', align, color}`, `text {text}`
+(wrapped), `button {id, text, onClick(app, item), disabled, primary, color}`, `toggle {id, text, value,
+onChange(v, app)}`, `row {items: [button|toggle…]}`, `list {id, options:[{id, text, sub, color}], selected,
+pageSize=5, onSelect(id, option, app), emptyText}` (paged), `stepper {id, text, value, onDec, onInc, onDec2?,
+onInc2?}`, `progress {value, color}`, `spacer {height}`. A panel's height follows its content (the canvas
+texture is re-created on resize); `panel.hits` are the clickable regions in canvas pixels (`panel.hitAt(px,
+py)`), `panel.refresh()` re-layouts, `panel.invalidate()` redraws. Panels created by the App: `main`,
+`settings`, `duo`, `calibrate`, `record-setup`, `record-review`, `results`, `results-moves`, `highscores`.
+
+### `index.html`, `manifest.webmanifest`, `sw.js`, `assets/`
+
+`index.html`: import map `three → ./vendor/three.module.js`, start overlay (`#overlay`, `#btn-vr` "VR
+starten" → `app.enterVR()` requesting `immersive-vr` with `requiredFeatures: ['local-floor']`,
+`optionalFeatures: ['hand-tracking', 'bounded-floor']`; `#btn-emu` "Am PC testen" → `app.enterEmu('desktop')`;
+`#status`; `#version`), loads `./src/app.js`. No external requests. `sw.js` is registered by the App as
+`./sw.js?v=<APP_VERSION>`; it precaches the shell (index, manifest, icons, three, all `src/` modules
+incl. other lanes' files — missing ones are skipped, `choreos/index.json` + the two procedural dances,
+`models/free/*.json`), caches `src/ vendor/ models/ choreos/ assets/` cache-first at runtime (the int8 models
+and the mocap dance on first use) and serves `/api/*` network-first with cache fallback; old
+`dp-shell-*` caches are deleted on activate; `postMessage({type:'clearCache'})` empties them. Icons:
+`assets/icon.svg` (source) and `icon-192.png` / `icon-512.png` rendered from it with headless Chromium.
+
+Addendum (presentation): `app.setBodyAvatarPoseProvider(fn, skeleton?, { unscaled: true })` multiplies the
+provider's pose by `playerS.k` before rendering — use it with `NeuralAvatarDriver.getPose` (unscaled S, real
+metres): `app.setBodyAvatarPoseProvider((t) => driver.getPose(buf, t), skeleton, { unscaled: true })`.
+
+## Appendix: server & duo API
+
+Lane *server-duo*: `server/server.js` (Node ≥ 18, deps `ws`, `selfsigned`; `npm install` inside
+`server/`), `webxr/src/duo/ghost.js`, `webxr/src/duo/online.js`, `webxr/src/duo/benchmark.js`.
+Tests: `tests/unit/{ghost,benchmark,server}.test.js` (the server test spawns the server as a
+child process with `--http --http-port 0 --no-https --data <tmp>` and skips itself when `ws` is
+not installed). All duo modules are pure JS (no three.js/DOM), importable in Node.
+
+### `server/server.js`
+
+`node server/server.js [--port 8443] [--http-port 8080] [--http|--no-http] [--no-https]
+[--host 0.0.0.0] [--dir ../webxr] [--data server/data] [--cert x.pem --key y.pem] [--no-coep]
+[--verbose] [--quiet]`. Defaults: HTTPS **and** HTTP listeners on; `--http` only forces the HTTP
+listener on, `--no-https` drops the HTTPS listener (no certificate needed – use it in tests/CI,
+e.g. `--http --http-port 8090 --no-https`, otherwise a first start also generates a certificate
+and binds 8443). `--http-port 0` picks a free port. After start‑up stdout carries one
+machine‑readable line `READY {"https":8443|null,"http":8080|null,"urls":[…],"data":"…"}`.
+Certificate: `<data>/cert/server.{key,crt}` + `meta.json`, self‑signed, 10 years, SANs =
+`localhost, 127.0.0.1` + all LAN IPv4s; regenerated automatically when a LAN IP is missing from
+the SANs or the cert expires within 30 days. Exports (for programmatic use): `DancingPointsServer`
+(`new DancingPointsServer(parseArgs(argv)).start()`, `.close()`, `.info()`, `.urls()`,
+`.httpPort/.httpsPort`), `parseArgs`, `ensureCertificate`, `lanAddresses`, `validateResult`,
+`validateRun`, `fallbackValidateChoreo`, constants `SERVER_VERSION, WS_PATH='/ws',
+MAX_WS_MESSAGE=4096, RATE_PER_SEC=30, RATE_BURST=30, MAX_ROOM_PLAYERS=2, MAX_RUNS_PER_CHOREO=50,
+MAX_RESULTS=5000, MAX_BODY_CHOREO=5 MB, MAX_BODY_DEFAULT=1 MB`.
+
+Static: `--dir` root, directory → `index.html` (301 to the trailing slash), MIME per extension
+(`.js/.mjs` `text/javascript`, `.wasm` `application/wasm`, `.onnx/.bin` `application/octet-stream`,
+`.json` `application/json`, `.webmanifest` `application/manifest+json`, audio/image/font types),
+`Cache-Control: no-cache` for `.html/.json/.webmanifest` and `sw.js`, `public, max-age=3600`
+otherwise, weak ETag + `If-None-Match` → 304, `Range` → 206, HEAD, path traversal blocked.
+Every response carries `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy:
+require-corp` (unless `--no-coep`), `Cross-Origin-Resource-Policy: cross-origin`,
+`X-Content-Type-Options: nosniff`; `/api/*` additionally `Access-Control-Allow-Origin: *` (+
+OPTIONS preflight), so the app may also be served from GitHub Pages and talk to a LAN server via
+`?server=`.
+
+REST (JSON; errors are `{error, errors?}` with 400/404/405/413/500):
+
+| route | behaviour |
+|---|---|
+| `GET /api/info` | `{name, version (APP_VERSION), serverVersion, urls[], primaryUrl, https, http, httpsPort, httpPort, wsPath, serverTime, uptimeSec, rooms, clients, choreoValidator:'app'\|'fallback', limits{…}}` |
+| `GET /api/health` | `{ok:true, serverTime}` |
+| `GET /api/choreos` | `{choreos:[entry]}`: `webxr/choreos/index.json` entries (`+ url:'/choreos/<file>', source:'shipped'`) merged with uploads (`{id,title,artist,bpm,durationBeats,difficulty,file:'<id>.json', url:'/api/choreos/<id>', source:'upload', uploadedAt}`); an upload with a shipped id replaces that entry in place (`replaces:'shipped'`). **Clients should load `entry.url`** (absolute path on the server origin). |
+| `GET /api/choreos/:id` | the JSON (upload first, then the shipped file), `no-cache` |
+| `POST /api/choreos` | body ≤ 5 MB, `validateChoreo` from `webxr/src/game/choreo.js` (structural fallback when the app tree is absent) → `data/choreos/<id>.json`; 201 `{ok, id, url, entry}` / 400 `{error, errors[]}` |
+| `DELETE /api/choreos/:id` | removes an upload (404 for shipped ids) |
+| `GET /api/results?choreoId=&player=&limit=100` | `{results:[…]}` newest first |
+| `POST /api/results` | ≤ 1 MB; `validateResult` (`choreoId` id‑pattern, `score` 0..100, optional `stars 0..5, maxCombo ≥ 0, timingBias, player, mode, playedAt ISO, moves ≤ 256, perBeat ≤ 8192`); adds `id, receivedAt` (+ `playedAt` if missing); stored in `data/results.json` (debounced atomic write, ≤ 5000 kept); 201 `{ok, id, result}` |
+| `GET /api/runs?choreoId=&limit=100` | `{runs:[meta]}` newest first, **metadata only** `{id, choreoId, player, score, mode, playedAt, receivedAt, fps, frameCount, url:'/api/runs/<id>'}` |
+| `GET /api/runs/:id` | the full run JSON as uploaded (+ `id, receivedAt`) |
+| `POST /api/runs` | ≤ 5 MB; `validateRun` accepts `dancing-points-run/1` (`head[][7]/left[][3]/right[][3]`) or the compact `{frames:[[hx,hy,hz,lx,ly,lz,rx,ry,rz]]}` layout, `fps` in (0,240], 1..20000 frames; stored as `data/runs/<choreoId>/<id>.json`; **cap 50 per choreography** (oldest by `receivedAt` deleted, ids returned in `removed[]`); 201 `{ok, id, url, run: meta, removed}` |
+| `DELETE /api/runs/:id` | removes one run |
+| `GET /api/rooms` | `{rooms:[{code, choreoId, players:[{id,name,host}], maxPlayers, startAt, createdAt}]}` |
+
+WebSocket relay at `/ws` on both listeners (`wss://ip:8443/ws`, `ws://ip:8080/ws`). Text
+frames with JSON, `type` required, ≤ 4 KB (`ws` closes with 1009 above), token bucket 30 msg/s
+with burst 30 per client (excess dropped silently; one `{type:'error', code:'RATE_LIMIT',
+dropped}` per second). Server → client on connect: `{type:'hello', id, serverTime, version,
+maxPlayers}`. Client → server:
+
+| message | reply / effect |
+|---|---|
+| `{type:'ping', t0}` | `{type:'pong', t0, t1}` (`t1` = server `Date.now()`) |
+| `{type:'create', name, choreoId?}` | creates a room (code: 4 letters from `ABCDEFGHJKLMNPQRSTUVWXYZ`), sender = host; reply `{type:'room', code, choreoId, players, maxPlayers, startAt, createdAt, you, host:true}` |
+| `{type:'join', code, name}` | reply `room` (`host:false`); others get `{type:'peer', event:'joined', room, player, players}`; errors `ROOM_NOT_FOUND`, `ROOM_FULL` |
+| `{type:'leave'}` | reply `{type:'left', room:null}`; others get `peer` `event:'left'` and, if the host left, `peer` `event:'host'` (first remaining player becomes host). Closing the socket leaves too. Empty rooms are deleted. |
+| `{type:'setChoreo', choreoId}` | host only; **everyone** in the room (incl. sender) gets `{type:'choreo', room, from, choreoId}` |
+| `{type:'start', choreoId?, delayMs=3000}` | host only (`NOT_HOST`); `delayMs` clamped 200..30000; **everyone** gets `{type:'start', room, from, choreoId, startAt, delayMs, serverTime, players}` with `startAt` = server clock ms at which the **count‑in** begins |
+| `{type:'state', t, head:[7], left:[3], right:[3], score, combo}` | relayed to the **other** room member(s) only, with `from` (client id) and `room` added |
+| any other type (`result`, `abort`, `emote`, …) | relayed likewise (`NOT_IN_ROOM` when not in a room). Types `hello/pong/error/room/peer/left` are reserved (`BAD_MESSAGE`). |
+
+Errors: `{type:'error', code, message (German, player‑facing), …}` with codes `ROOM_NOT_FOUND,
+ROOM_FULL, NOT_HOST, NOT_IN_ROOM, BAD_REQUEST, RATE_LIMIT, BAD_JSON, BAD_MESSAGE`. Heartbeat: ws
+ping every 30 s, unresponsive sockets are terminated.
+
+### `src/duo/ghost.js`
+
+Run layouts accepted everywhere: `dancing-points-run/1` (from `PlaySession.runToJSON()`), the
+compact `{choreoId, fps, frames:[[hx,hy,hz, lx,ly,lz, rx,ry,rz], …]}` (head quaternion = identity,
+`hasQuat=false`), or an already normalized run.
+`validateRun(run) → {ok, errors, frameCount}`, `normalizeRun(run) → {normalized:true, format,
+choreoId, fps, frameCount, duration, head Float32Array(N·7), left/right Float32Array(N·3),
+hasQuat, score, player, playedAt, mode, id}` (idempotent, throws with `.errors`),
+`runToJSON(run, {compact=false, digits=4})`, `sampleRunInto(run, t, outHead, oh, outLeft, ol,
+outRight, or) → bool` (lerp into flat arrays at offsets, clamped, no allocation),
+`createRunSample() → {t, head:{p,q}, left:{p}, right:{p}}` (same shape as `Choreo.sampleAt`).
+`class GhostDuo { constructor(run, {name?}); run, choreoId, fps, frameCount, duration, score,
+player, playedAt, hasQuat, name; sampleAt(t, out?) (lerp + slerp, clamped, reused internal object,
+0 allocations); frameIndexAt(t); headSpeedAt(t); toJSON(opts) }`. Render recipe: `ghost.sampleAt(
+session.t)` → pose a translucent `PointAvatar` at `STAGE.duoSideOffset` beside the teacher.
+Storage (localStorage‑like `{getItem,setItem,removeItem}`, key `STORAGE_KEYS.runs = 'dp.runs'`,
+a plain array oldest‑first): `saveRun(run, storage, {key, maxPerChoreo=5, maxTotal=20}) → bool`
+(quota error → drops the oldest half and retries once), `loadRuns(storage, {key, choreoId}) →
+run[]` newest first (invalid/corrupt entries skipped), `clearRuns(storage, {key, choreoId})`,
+`capRuns(list, maxPerChoreo, maxTotal)`, `pickRun(runs, {choreoId, strategy:'latest'|'best'|
+'closest', score})`. Server: `toHttpBase(url)` (`wss://h:p/ws` → `https://h:p`),
+`uploadRun(run, baseUrl='', fetchImpl?) → reply`, `fetchRunList(baseUrl, {choreoId, limit,
+fetchImpl}) → meta[]`, `fetchRun(baseUrl, idOrUrl, fetchImpl?) → run`, `loadGhost({choreoId,
+storage?, baseUrl?, fetchImpl?, strategy, score}) → Promise<GhostDuo|null>` (server first, then
+local store; server failures are only `console.warn`ed). Constants `RUN_FORMAT,
+RUN_STORAGE_KEY, DEFAULT_MAX_RUNS_PER_CHOREO, DEFAULT_MAX_RUNS_TOTAL, MAX_RUN_FRAMES`.
+
+### `src/duo/online.js`
+
+`toWsUrl(serverUrl)` (`https://h:p` | `http://` | `wss://` | `h:p` → `wss://h:p/ws`; `?server=`
+values work directly), `toHttpUrl(serverUrl)` (for REST). `class OnlineDuo extends EventEmitter {
+constructor({WebSocketImpl = globalThis.WebSocket (Node: pass `ws`), now = Date.now, stateHz=15,
+pingCount=5, pingTimeoutMs=2000, requestTimeoutMs=5000, interpolationDelaySec=0.1,
+bufferSize=16}) }`. Properties: `state 'idle'|'connecting'|'connected'|'lobby'|'playing'|'closed'`,
+`connected`, `id`, `serverVersion`, `room {code, choreoId, players[{id,name,host}], maxPlayers,
+startAt}`, `roomCode`, `isHost`, `peer` (the other player or null), `offsetMs` (server − local),
+`rttMs`, `synced`, `startAt` (server ms), `startAtLocalMs`, `startChoreoId`, `lastError`,
+`stats {sent, received, droppedRate, remoteStates}`, `remoteStateCount`, `remoteLatest`,
+`remoteScore`, `remoteCombo`. Methods (promises reject with `err.code` = server error code or on
+timeout): `connect(url) → Promise<this>` (resolves after `hello`), `disconnect(code, reason)`,
+`dispose()`, `syncClock(count=5) → {offsetMs, rttMs, samples}` (sequential pings, offset =
+median of `t1 − (t0 + t3)/2`), `serverNow()`, `toLocalMs(serverMs)`, `toServerMs(localMs)`,
+`createRoom(playerName, choreoId?) → room`, `joinRoom(code, playerName) → room`, `leaveRoom()`,
+`setChoreo(choreoId)` (host), `start(choreoId, {delayMs=3000}) → {choreoId, startAt,
+startAtLocalMs, delayMs}` (host; resolves when the server's broadcast arrives), `sendState(t,
+headP, headQ, leftP, rightP, score, combo) → bool` (≤ `stateHz`, one reused message object,
+values rounded to 0.1 mm; `false` when throttled or not in a room), `sendStateFromSample(t,
+sampleS, score, combo)`, `sendResult(result)` (compact copy: no `perBeat`, moves reduced to
+`{name, score, grade}`), `send(type, payload)` / `sendRaw(obj)` (generic relay),
+`getRemoteSample(tNow, out?) → {t, head:{p,q}, left:{p}, right:{p}, score, combo, age} | null`
+(interpolates the buffered partner states at `tNow − interpolationDelaySec`, nlerp for the
+quaternion, holds the newest/oldest state outside the buffer, `age` = seconds since the last
+state arrived; reused object, 0 allocations), `resetRemote()`.
+Events: `open`, `hello`, `room` (room), `peer` `{event:'joined'|'left'|'host', player, players}`,
+`choreo` `{choreoId}`, `start` `{choreoId, startAt, startAtLocalMs, delayMs, from}` (also for the
+guest), `state` (raw relayed message), `result` `{from, result}`, `message` (other types),
+`error` `{code, message, handled}`, `sync`, `left`, `close` `{code, reason}`, `disconnected`
+(unexpected close after a successful connect). The remote buffer is reset on `room`, `start`
+and when the peer leaves.
+Start recipe on both headsets (after `syncClock()`): `const wait = (startAtLocalMs − Date.now()) /
+1000; clock.start(choreo.bpm, choreo.countInBeats, {startAt: clock.sourceNow() + wait});` then
+per scored tick `online.sendStateFromSample(session.t, session.playerS, session.score,
+session.combo)` and per render frame `online.getRemoteSample(session.t)` → partner avatar
+at `STAGE.duoSideOffset`.
+
+### `src/duo/benchmark.js`
+
+Pure functions (may allocate; called once per results screen). Runs may be JSON or normalized.
+`alignRuns(runA, runB, {fps=A.fps, lagSec=0, mirror=false, removeOffset=true}) → {n, fps, A, B,
+offset, lagSec, mirror}` (both resampled on A's grid over the common duration; `mirror` mirrors
+B: x → −x, hands swapped; `removeOffset` subtracts the mean head offset B−A from all B points),
+`syncDistanceDetails(runA, runB, opts) → {mean, head, left, right, frames, durationSec, offset,
+lagSec, mirror}`, **`syncDistance(runA, runB, opts) → metres`** (mean of the three point
+distances; `NaN` without overlap), `headSpeedSignal(run, fps, n) → Float32Array`,
+`syncLagDetails(runA, runB, {maxLagSec=1.0, fps=30, lagPenalty=0.1}) → {lag, correlation,
+lagFrames, fps, maxLagSec, valid, frames}`, **`syncLag(runA, runB, opts) → seconds, positive = B
+is behind A`** (`B(t) ≈ A(t − lag)`; normalized cross‑correlation of the zero‑mean, unit‑variance
+head speed signals, peak search tapered by `1 − lagPenalty·|k|/K` so the smallest of the
+beat‑periodic peaks wins, parabolic sub‑frame refinement; `valid=false`, lag 0 for constant
+signals or overlap < 2·maxLagSec). Measured on the synthetic choreography: lag 0.1 s recovered
+within 0.02 s, correlation > 0.9; identical runs → 0 s.
+`compareResults(a, b)` (best‑first comparator: score, stars, maxCombo desc, |timingBias| asc,
+playedAt asc), **`winner(resultA, resultB) → 'A'|'B'|'tie'`** (score → maxCombo → smaller
+|timingBias|; a missing result loses), `playerSummary(result, name?) → {name, score, stars,
+maxCombo, timingBias, durationSec, perMove:[{name, score, grade, gated}], mode, playedAt,
+choreoId}`, **`buildBenchmark(resultA, resultB, runA?, runB?, {nameA, nameB, mode='duo', mirror,
+maxLagSec, createdAt, choreoId})`** →
+```
+{ format:'dancing-points-benchmark/1', choreoId, createdAt, mode, players:[A, B],
+  pair:{ syncDistance, syncDistanceAligned (with the measured lag removed), syncDistanceHead/Left/Right,
+         syncLag, syncCorrelation, framesCompared, scoreDiff (A−B), comboDiff }, winner }
+```
+(pair metrics `null` without both runs). Export: `toJSON(benchmark)` (pretty string),
+**`toCSV(benchmark, {separator=','})`** (`section,key,A,B` rows: `meta`, `player` (name, score,
+stars, maxCombo, timingBias, durationSec, playedAt), one `move` row per move, `pair` rows incl.
+`winner`; CRLF, RFC‑4180 quoting via `csvCell`). Leaderboard: `isResultLike(r)`, `resultKey(r)`,
+`mergeResults(...lists)` (de‑duplicates local + server copies), `toEntry(r, rank)`,
+**`leaderboard(results, {choreoId, top=10, mode?, player?}) → [{rank, choreoId, player, score,
+stars, maxCombo, timingBias, playedAt, mode, source}]`** (`top=0` = all), `leaderboards(results,
+{top, mode}) → {choreoId: entries}`, `rankOf(results, result) → 1‑based rank` (the result is
+inserted if not present), `leaderboardToCSV(entries)`. Constants `BENCHMARK_FORMAT,
+DEFAULT_MAX_LAG_SEC, DEFAULT_LAG_PENALTY, DEFAULT_TOP`.
+
+## Appendix: integration (src/app.js wiring, src/render/mirror.js, src/duo/modes.js, tests/e2e, CI)
+
+Lane *integration*: everything is wired end to end and verified by `npm run test:e2e`
+(`tests/e2e/smoke.test.js`, headless Chromium against `server/server.js`). Measured in this
+container (SwiftShader, 4 cores): exact playback `snoop-cwalk` 100 / `tutorial-basics` 100,
+`noise=0.35` → 1, neural avatar 35 poses in a 4 s run (mean 31.5 ms per inference, 3 wasm
+threads because the server's COOP/COEP headers make the page cross‑origin isolated; model load
+2.9–3.3 s from localhost), ghost duo benchmark of two exact runs `syncDistance` 0.001 m /
+`syncLag` −1 ms, online duo (two pages, one room, `startAt` sync) both 100 with the partner's
+result and ~700 recorded partner frames on each side.
+
+### `src/app.js` additions
+
+* **Avatar default**: `settings.avatar` is `'neural'` on the headset; with `?emu=…` it becomes
+  `'points'` unless `?avatar=neural` is given explicitly (`parseExtraParams().avatarExplicit`).
+* **Neural avatar** (`app.neural = { driver, ready, info, poses, state, notice, fallback, loadMs }`):
+  `_neuralEnsure()` creates the `NeuralAvatarDriver` once (at boot when `avatar === 'neural'`, or
+  from the settings button) with `config.NET` parameters; the models load while the player is in
+  the menu. `_neuralSync()` starts/stops feeding by state (`NEURAL_STATES` = CALIBRATE,
+  COUNTDOWN, PLAYING, RESULTS, RECORDING, RECORD_REVIEW); `_frame` feeds
+  `driver.update(app.playerS, time / 1000)` (wall time keeps the 30 Hz resampling monotonic in
+  `speed ≠ 1` playback). On `ready` the driver's `{joints, parents, boneLengths}` become the body
+  skeleton (`setBodyAvatarPoseProvider(…, {unscaled: true})` + `mirror.setSkeleton`). Guard
+  fallback (`disabled`), load errors and missing Worker support set `neural.fallback` (reason
+  string), show `hudNeuralDisabled` / `errorModelLoad` and leave the mirror on points.
+  `app.on('neural', {state, notice, inferenceMs, inferEvery})`. The settings button "Telemetrie
+  exportieren" calls `driver.downloadTelemetry()` (false → "Keine Telemetrie" notice).
+* **Player mirror** (`app.mirror`, `PlayerMirror` under `stage` at S `(−duoSideOffset, 0,
+  −teacherDistance)`): shown in `MIRROR_STATES` (COUNTDOWN, PLAYING, RESULTS, RECORDING,
+  RECORD_REVIEW) unless `avatar === 'off'`; body when a neural pose exists, otherwise the three
+  points. The self body (`playerBody`) is only visible when not presenting in XR (desktop /
+  `?cam=third`) and has no head sphere.
+* **Server detection** (`_probeServer()` at boot, before the choreo list): `?server=` wins
+  (`app.serverUrl` as given, `app.serverHttp` = REST base with `ws→http`); otherwise
+  `GET api/info` next to `index.html` (the server must answer with `serverVersion`) makes the
+  page's own origin the server (`app.serverInfo`). Every REST call (`/api/choreos`, `/api/results`,
+  `/api/runs`, `Recorder.upload`) and the mode context (`ctx.server`, `ctx.httpBase`) use these.
+  `loadChoreoList` loads server entries from `entry.url` (uploads replace a shipped id).
+  `sw.js` never caches `/api/info` and `/api/health`, so the probe fails honestly offline.
+* **Mode interface additions**: `mode.startOptions(ctx) → {startAt?}` (merged into
+  `PlaySession.start`, which now forwards `startAt` to `BeatClock.start`); `onFinished` may
+  return `{lines, moveLines, buttons}` where lines can be functions (re-evaluated on
+  `menu.refresh('results')`) and `buttons` are menu button items added as a row on the results
+  panel; a thrown error with `err.notice` in `prepare` shows that German text instead of
+  `errorChoreoLoad`. `playAgain()` of the online mode returns to the duo lobby. `app.lastBenchmark`
+  holds the last duo benchmark; `_storeResult` stores a compact `benchmark {mode, winner, pair,
+  partner}` with the result (localStorage + `/api/results`, the server keeps unknown fields).
+* Duo modes are registered at boot (`registerDuoModes(app)`); the duo panel's "Online (WLAN)"
+  button (`_onlineButton`) shows the lobby panel and connects when a server is known.
+
+### `src/render/mirror.js` — `PlayerMirror`, `MIRROR_MODES`
+
+`new PlayerMirror({color, opacity=0.85, skeleton?, mode='points'})` (Group): `setSkeleton({joints,
+parents, boneLengths?})` builds the `BodyAvatar`; `setMode('body'|'points'|'off')`;
+`setPointSample(sampleS)` and `setBodyPose(Float32Array(jointCount·3))` mirror the player's
+stage‑frame data through the plane halfway to the stage: in the group's frame `p' = (x, y, −z)`
+(hands keep their side, the image moves to the player's right when the player does) and the head
+quaternion `q' = (−q.z, q.w, −q.x, q.y)` (= reflection `M R M`, `M = diag(1,1,−1)`, followed by a
+180° yaw so the nose points at the player). `usesBody`, `hasPose`, `setColor`, `setOpacity`,
+`dispose`. No allocation in the setters.
+
+### `src/duo/modes.js` — `createGhostMode(app)`, `createOnlineMode(app, {WebSocketImpl?})`, `registerDuoModes(app)`, `downloadText`, `START_DELAY_MS = 8000`, `ROOM_ALPHABET`
+
+* **ghost**: `prepare` → `loadGhost({choreoId, storage, baseUrl: httpBase, strategy: 'best'})`
+  (server first, then `dp.runs`; none → `err.notice = duoNoRuns`); `onSessionCreated` adds a
+  translucent `PointAvatar` (`AVATAR_COLORS.ghost`) at `(duoSideOffset, 0, −teacherDistance)`, a
+  HUD panel `'duo'` (`{width 1.0, height 0.4, position [1.6, 1.84, 0.02]}`, "Du 87 / Aufzeichnung
+  91") and scores the ghost **live** with a second `Scorer` on the session's `'tick'` events
+  (`mode.scorer.currentScore()`); `onFinished` finalizes the ghost's Result and builds
+  `buildBenchmark(result, ghostResult, app.lastRun, ghost.run, {mode: 'ghost'})` → lines
+  (partner score/stars/combo, winner, `Synchronität: Abstand x cm · Versatz ±n ms`), a per‑move
+  "A / B" line and the export buttons (`dp-benchmark-<choreo>-<mode>-<time>.json|csv` via
+  `downloadText`, notice `duoExported`).
+* **online**: `init` adds the lobby panel `'duo-online'` (shown alongside `'duo'` in
+  `DUO_LOBBY`; status, room code, players, "Raum erstellen", code entry — `window.prompt` on the
+  desktop, four letter steppers over `ROOM_ALPHABET` in VR — "Raum beitreten", "Als Host
+  starten", "Raum verlassen"; footer server + RTT) and connects on the `'lobby'` event
+  (`ensureConnected()` = `OnlineDuo.connect(serverUrl)` + `syncClock()`). `createRoom()`,
+  `joinRoom(code)`, `leaveRoom()`, `startAsHost(choreoId, {delayMs})` (re‑syncs the clock, then
+  `online.start`). The server's `start` broadcast (`_onStart`) calls `app.startMode('online',
+  choreoId)` on **both** headsets; `startOptions(ctx)` returns `{startAt: ctx.clock.sourceNow() +
+  (startAtLocalMs − Date.now()) / 1000}` so both count‑ins begin at the same wall time (a longer
+  count‑in is shown while waiting). Per tick: `sendStateFromSample` (15 Hz) and the partner's
+  interpolated sample is recorded into a 30 Hz run (`mode.remote` → `mode.remoteRun` as
+  `dancing-points-run/1`, hold‑filled); per frame the partner `PointAvatar`
+  (`AVATAR_COLORS.opponent`) and the HUD panel (`online.remoteScore`). `onFinished` sends the
+  result (`sendResult`); when the partner's `result` message has arrived (before or after) the
+  benchmark is built (`mode: 'online'`) and the results panel refreshed. `exit` removes avatar,
+  panel and listeners but keeps the connection (the room survives for the next round);
+  `dispose()` closes it. Properties for tests: `online` (the `OnlineDuo`), `status`, `roomCode`,
+  `isHost`, `startInfo`, `remoteResult`, `benchmark`, `lastResult`.
+* New `texts.js` keys (de/en): `duoLeaveRoom, duoConnecting, duoConnected, duoEnterCode, duoHost,
+  duoWaitingResult, duoRemoteMissing, duoGhostLoaded, duoExported, duoExportFailed,
+  duoStartFailed, duoConnectFailed, duoOnlyHost, duoStartingSoon, duoSyncDistance`.
+
+### Shipped full‑body teacher for the procedural dances
+
+`webxr/choreos/snoop-cwalk.json` and `tutorial-basics.json` now carry `fullBody` from
+`tools/precompute_teacher.py --models webxr/models/free --net-scale 1.1553` (int8 tracking net,
+3.5 s / 2.7 s runtime; the net scale is `referenceHeight / standingHeadHeight` of the dataset
+character, as for the mocap demo). Plausibility (numpy): no NaN, bone lengths ≤ 1.05 × (scaled)
+skeleton, root within ±0.42 m, feet 2–27 cm above the floor, joint speeds ≤ 3.4 m/s; head error vs
+the 3‑point reference 7.2 cm / 6.1 cm mean (max 22 / 12 cm), wrists ~11 cm mean — comparable
+with the mocap demo's 9 cm, so the `TeacherAvatar` renders a body for all three shipped dances.
+`tools/gen_choreos.js` keeps an existing file's `fullBody` + `meta.fullBodySource/fullBodyParams`
+when regenerating in place (`carryOverFullBody`, frame count must match; `stripFullBody` for
+comparisons); `tests/unit/choreos-files.test.js` compares the regenerated three‑point content
+(`serializeChoreo(stripFullBody(committed)) === fresh`) and validates the body block. File sizes:
+629 kB / 471 kB (limit in the test 1 MB).
+
+### Tests, scripts and CI
+
+* Root `package.json`: `test` = `node --test tests/unit/*.test.js` (Node 22 rejects a bare
+  directory), `test:e2e` = `node --test tests/e2e/*.test.js`, `test:all`, `start`, `start:http`,
+  `gen:choreos`; devDependency `playwright-core@1.63.0`; `postinstall` installs `server/`.
+* `tests/e2e/smoke.test.js`: starts `server/server.js --http --http-port 0 --no-https --data
+  tests/.tmp/e2e-data-*` (READY line), launches the Chromium from `PLAYWRIGHT_CHROMIUM`,
+  `/opt/pw-browsers/chromium-*/chrome-linux/chrome` or `chromium.executablePath()` (skips with a
+  message otherwise) with SwiftShader + no background throttling; one shared context for (a)–(h)
+  (localStorage carries results/runs between tests), two small separate contexts for the online
+  duo (i). Assertions: (a) boot, 3 shipped dances, same‑origin server detected, `avatar ==
+  'points'`; (b) snoop ≥ 90, result + run local and on the server, results panels, "Menü" →
+  main menu; (c) noise 0.35 ≤ 70; (d) `avatar=neural` ≥ 1 finite pose with the mirror body or a
+  fallback reason; (e) tutorial ≥ 90; (g) record → save → upload → play; (h) ghost benchmark
+  (`syncDistance < 0.05`, `|syncLag| < 0.1`, export buttons); (i) room code, join, host start,
+  both RESULTS ≥ 90, partner scores/results/frames, `syncDistanceAligned < 0.25`.
+* `.github/workflows/ci.yml`: unit job (Node 22, `npm ci`, `npm test`, `py_compile` of the tools)
+  and e2e job (`npx playwright-core install --with-deps chromium`, `npm run test:e2e`).
+  `.github/workflows/pages.yml`: `upload-pages-artifact` of `webxr/` + `deploy-pages` on push to
+  `main` / manual dispatch. `.gitignore` adds `node_modules/`, `server/data/`, `tests/.tmp/`,
+  `.playwright/`.
+
+Addendum (integration): the teacher's representation is no longer coupled to the avatar setting —
+`TeacherAvatar` is always in `'auto'` mode (full body whenever the choreography carries
+`fullBody`, otherwise points); the settings entry "Avatar: Neural / Punkte / Aus" only selects
+how the *player* is shown (neural body, three points, or no mirror). Reason: the shipped dances
+now all have a body, the body is one instanced draw call, and the emu default of `'points'`
+would otherwise hide the teacher's body on the desktop.
