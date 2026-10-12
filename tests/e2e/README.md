@@ -72,12 +72,53 @@ const score = await page.evaluate(() => window.__dp.app.lastResult.score);
 ```
 
 SwiftShader renders the scene at roughly 20 fps at 1280×720; a `speed=10` run of the 32 s
-C-Walk takes about 5 s of wall time. `npm run test:e2e` runs `tests/e2e/smoke.test.js`
+C-Walk takes about 5 s of wall time. `npm run test:e2e` runs `tests/e2e/*.test.js` sequentially
 (`node --test`, playwright-core from the root `devDependencies`) against this contract: it starts
 `server/server.js --http --http-port 0 --no-https --data tests/.tmp/...` so the same-origin REST
 API and the duo relay are covered as well, and skips with a clear message when no Chromium is
 found (`PLAYWRIGHT_CHROMIUM=<chrome>`, `/opt/pw-browsers/chromium-*`, or
 `npx playwright-core install chromium`).
+
+### Controlled inference delays and failure handling
+
+Run only the performance regressions with:
+
+```bash
+npm run test:performance
+# or just the headless browser scenarios:
+node --test tests/e2e/performance-guard.test.js
+```
+
+The headless scenarios use a small local HTTP server and the existing exact-playback emulation.
+The production app, `NeuralAvatarDriver`, ES-module `worker.js`, `DPPipeline`, and transferable
+pose buffers all run normally. The server substitutes only the ORT/session boundary and ONNX
+bytes: `fixtures/controlled-ort.mjs` returns the existing Python-generated network-output
+fixtures, after controlled asynchronous waits. It does **not** run an ONNX model or WASM.
+
+The browser coverage adds:
+
+* 20 → 35 → 70 ms waits, with the production moving-average guard: full-rate scheduling,
+  nominal 15 Hz, then the points mirror and a stored fallback reason. The test checks both
+  `inferEvery` and the every-second-input-tick sequence numbers from real worker responses.
+* The same transitions with actual COOP/COEP headers present and absent, checking
+  `crossOriginIsolated`, `SharedArrayBuffer`, and the thread budget in both page and worker.
+* An explicit Settings retry after the guard disabled a previously working neural avatar.
+* Model initialization held pending while an entire emulated dance still reaches its normal
+  score; releasing initialization must activate the body correctly afterward.
+* A delayed inference across stop/reset/restart: the old pose must not enter the new dance.
+* A worker that stops answering: the response timeout must return to points while render
+  frames and scoring keep advancing, without saving a measured-performance verdict.
+
+The waits are real browser timers, so reported inference times include JavaScript pipeline
+work and scheduling overhead. Tests wait for states/poses rather than assuming an exact
+wall-clock frame rate. Avoid competing CPU-heavy browser jobs when running these scenarios;
+the default E2E command serializes the files. Exact threshold boundaries, hysteresis,
+deadline handling, and inference tick scheduling are checked by the deterministic CPU tests.
+
+These tests verify browser integration and failure handling. They do not benchmark int8
+inference, multi-threaded WASM speed, compositor latency, or Quest 2 performance. The real
+model smoke case in `smoke.test.js` remains the baseline for actual ORT/model execution;
+headset measurements are still necessary for a Quest 2 performance verdict.
 
 ## 5. Recording and other flows without a headset
 

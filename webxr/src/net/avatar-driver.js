@@ -90,6 +90,7 @@ export class NeuralAvatarDriver {
    *   rootCorrection / eulerRatio   post-processing parameters (forwarded to the worker)
    *   telemetry / telemetryTicks    record network I/O in the worker
    *   guard       {windowTicks, slowMs, disableMs, minTicks, recoverRatio}
+   *   initTimeoutMs (120000), responseTimeoutMs (2000): wall-clock limits for an unresponsive worker
    *   onPose(latest), onStatus({state, notice, ...}), onError(err)
    *   WorkerClass (tests), now() -> ms (tests), ortUrl / wasmDir (override the vendored ORT location)
    */
@@ -115,6 +116,8 @@ export class NeuralAvatarDriver {
     this.onError = o.onError || null;
     this.WorkerClass = o.WorkerClass || (typeof Worker !== 'undefined' ? Worker : null);
     this.now = o.now || defaultNow;
+    this.initTimeoutMs = o.initTimeoutMs > 0 ? o.initTimeoutMs : 120000;
+    this.responseTimeoutMs = o.responseTimeoutMs > 0 ? o.responseTimeoutMs : 2000;
 
     this.worker = null;
     this.state = 'idle'; // idle | loading | ready | running | slow | disabled | error | disposed
@@ -160,6 +163,19 @@ export class NeuralAvatarDriver {
     this.frameCount = 0;
     this.frameMedianMs = 0;
     this.frameSlowWindows = 0;
+    this._frameLimited = false;
+
+    // Sequence numbers stay monotonic across resets. A queued reply from the previous run
+    // must not seed the new avatar (or contribute a stale timing to its performance guard).
+    this._minPoseSeq = 1;
+    this._lastPoseSeq = 0;
+    this._initTimer = null;
+    this._responseTimer = null;
+    this._responseFrames = 0;
+    this._onResponseTimeout = () => {
+      this._responseTimer = null;
+      if (this.active) this._fail('inference response timed out after ' + this.responseTimeoutMs + ' ms', 'response-timeout');
+    };
 
     this._pendingTelemetry = [];
     this._readyResolve = null;
@@ -184,7 +200,11 @@ export class NeuralAvatarDriver {
       }
       this.worker.onmessage = this._onMessage;
       this.worker.onerror = this._onError;
-      this.worker.postMessage({
+      this._initTimer = setTimeout(() => {
+        this._initTimer = null;
+        if (this.state === 'loading') this._fail('model initialization timed out after ' + this.initTimeoutMs + ' ms', 'init-timeout');
+      }, this.initTimeoutMs);
+      this._post({
         type: 'init',
         modelsUrl: this.modelsUrl,
         ortUrl: this.ortUrl,
@@ -207,17 +227,14 @@ export class NeuralAvatarDriver {
     this.tA = this.tB = -1;
     this.nextTickT = -1;
     this.poseIntervalMs = 1000 * this.tickSec * this.inferEvery;
-    if (this.state === 'ready') this._setState('running', '');
+    if (this.state === 'ready') this._setState(this.inferEvery === 2 ? 'slow' : 'running', this.inferEvery === 2 ? NOTICES.slow : '');
     return true;
   }
 
   /** Stop feeding frames and forget the history (the worker keeps its models). */
   stop() {
     if (this.state === 'running' || this.state === 'slow') this._setState('ready', '');
-    this.tA = this.tB = -1;
-    this.nextTickT = -1;
-    this.poseCount = 0;
-    if (this.worker) this._post({ type: 'reset' });
+    this.reset();
   }
 
   /** Whether frames are currently accepted. */
@@ -280,6 +297,12 @@ export class NeuralAvatarDriver {
     this.seq++;
     this.stats.frames++;
     this._post({ type: 'frame', seq: this.seq, t, frame: this.frame });
+    // At 15 Hz one input may intentionally produce no pose. Expect progress only after
+    // inferEvery new frames since the last response, and never extend the deadline merely
+    // because more input is arriving. This does not wait on the render thread.
+    if (this.active && this.worker && ++this._responseFrames >= this.inferEvery && this._responseTimer === null) {
+      this._responseTimer = setTimeout(this._onResponseTimeout, this.responseTimeoutMs);
+    }
   }
 
   /**
@@ -318,6 +341,15 @@ export class NeuralAvatarDriver {
   /** Re-initialise the avatar at the next frame's root. */
   reset() {
     this.poseCount = 0;
+    this.tA = this.tB = -1;
+    this.nextTickT = -1;
+    this._minPoseSeq = this.seq + 1;
+    this._clearResponseTimer();
+    // A new run needs a complete render window. Preserve the conservative rate limit,
+    // but do not combine pre-pause judder with fresh healthy frames to disable it.
+    this.frameCount = 0;
+    this.frameMedianMs = this.stats.frameMs = 0;
+    this.frameSlowWindows = this.stats.frameSlowWindows = 0;
     this._post({ type: 'reset' });
   }
 
@@ -347,17 +379,36 @@ export class NeuralAvatarDriver {
 
   /** Terminate the worker. */
   dispose() {
-    if (this.worker) {
-      try { this.worker.postMessage({ type: 'dispose' }); } catch (e) { /* ignore */ }
-      this.worker.terminate();
-      this.worker = null;
-    }
-    for (const p of this._pendingTelemetry) p.reject(new Error('disposed'));
-    this._pendingTelemetry.length = 0;
+    if (this.state === 'disposed') return;
+    this._shutdown(new Error('disposed'));
     this._setState('disposed', '');
   }
 
   // -------------------------------------------------------------------------------------------
+
+  _clearResponseTimer() {
+    if (this._responseTimer !== null) clearTimeout(this._responseTimer);
+    this._responseTimer = null;
+    this._responseFrames = 0;
+  }
+
+  _shutdown(error) {
+    if (this._initTimer !== null) clearTimeout(this._initTimer);
+    this._initTimer = null;
+    this._clearResponseTimer();
+    if (this.worker) {
+      const worker = this.worker;
+      this.worker = null;
+      worker.onmessage = worker.onerror = null;
+      try { worker.postMessage({ type: 'dispose' }); } catch (e) { /* ignore */ }
+      worker.terminate();
+    }
+    this.poseCount = 0;
+    if (this._readyReject) this._readyReject(error);
+    this._readyReject = this._readyResolve = null;
+    for (const p of this._pendingTelemetry) p.reject(error);
+    this._pendingTelemetry.length = 0;
+  }
 
   _post(msg) {
     if (!this.worker) return;
@@ -381,21 +432,23 @@ export class NeuralAvatarDriver {
   }
 
   _fail(message, stage) {
+    if (this.state === 'disposed' || this.state === 'disabled' || this.state === 'error') return;
     console.warn('NeuralAvatarDriver: ' + message);
     const err = new Error(message);
     err.stage = stage;
-    if (this._readyReject) {
-      this._readyReject(err);
-      this._readyReject = this._readyResolve = null;
-    }
+    this._shutdown(err);
     this._setState('error', NOTICES.error);
     if (this.onError) this.onError(err);
   }
 
   _handle(msg) {
     if (!msg || typeof msg !== 'object') return;
+    if (this.state === 'disposed' || this.state === 'disabled' || this.state === 'error') return;
     switch (msg.type) {
       case 'ready':
+        if (this.state !== 'loading') break;
+        if (this._initTimer !== null) clearTimeout(this._initTimer);
+        this._initTimer = null;
         this.info = msg;
         this._setState('ready', NOTICES.ready);
         if (this._readyResolve) {
@@ -407,7 +460,7 @@ export class NeuralAvatarDriver {
         this._handlePose(msg);
         break;
       case 'progress':
-        if (this.onStatus) this.onStatus({ state: this.state, notice: NOTICES.loading, progress: msg, driver: this });
+        if (this.state === 'loading' && this.onStatus) this.onStatus({ state: this.state, notice: NOTICES.loading, progress: msg, driver: this });
         break;
       case 'telemetry': {
         const waiters = this._pendingTelemetry.splice(0);
@@ -427,10 +480,12 @@ export class NeuralAvatarDriver {
 
   _handlePose(msg) {
     const buffer = msg.buffer;
-    if (!this.active || !buffer) {
+    if (!this.active || !buffer || !Number.isInteger(msg.seq) || msg.seq < this._minPoseSeq || msg.seq <= this._lastPoseSeq) {
       if (buffer && this.worker) this._recycle(buffer);
       return;
     }
+    this._lastPoseSeq = msg.seq;
+    this._clearResponseTimer();
     const positions = new Float32Array(buffer, 0, POSE_FLOATS);
     const root = new Float32Array(buffer, POSE_FLOATS * 4, 3);
     const contacts = new Float32Array(buffer, (POSE_FLOATS + 3) * 4, 4);
@@ -490,7 +545,16 @@ export class NeuralAvatarDriver {
       this.inferEvery = 2;
       this._post({ type: 'config', inferEvery: 2 });
       this._setState('slow', NOTICES.slow);
-    } else if (this.inferEvery === 2 && mean < this.guard.slowMs * this.guard.recoverRatio && this.state === 'slow') {
+    } else {
+      this._maybeRecover();
+    }
+  }
+
+  _maybeRecover() {
+    // Both guards share inferEvery: a fast worker alone is not evidence that the XR
+    // compositor has recovered. Require a healthy render window if it caused the slowdown.
+    if (this.inferEvery === 2 && !this._frameLimited && this.msCount >= this.guard.minTicks &&
+        this.inferenceMs < this.guard.slowMs * this.guard.recoverRatio && this.state === 'slow') {
       this.inferEvery = 1;
       this._post({ type: 'config', inferEvery: 1 });
       this._setState('running', '');
@@ -522,6 +586,7 @@ export class NeuralAvatarDriver {
     const median = s[s.length >> 1];
     this.frameMedianMs = median;
     this.stats.frameMs = median;
+    this._frameLimited = median > this.guard.frameSlowMs;
     if (median > this.guard.frameDisableMs) {
       this.frameSlowWindows++;
       this.stats.frameSlowWindows = this.frameSlowWindows;
@@ -538,16 +603,12 @@ export class NeuralAvatarDriver {
       this._post({ type: 'config', inferEvery: 2 });
       this._setState('slow', NOTICES.slow);
     }
+    this._maybeRecover();
     return median;
   }
 
   _disable() {
-    if (this.worker) {
-      try { this.worker.postMessage({ type: 'dispose' }); } catch (e) { /* ignore */ }
-      this.worker.terminate();
-      this.worker = null;
-    }
-    this.poseCount = 0;
+    this._shutdown(new Error('neural avatar disabled: too slow'));
     this._setState('disabled', NOTICES.disabledSlow);
   }
 }

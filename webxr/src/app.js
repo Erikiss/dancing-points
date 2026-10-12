@@ -1474,9 +1474,11 @@ export class App extends EventEmitter {
     if (this.playerBody) this.playerBody.visible = mode === 'neural' && this.playerBody.hasPose;
     if (mode === 'neural') {
       // choosing 'Neural' in the settings is the operator's decision to try the network again
-      if (this.settings.neuralVerdict) {
-        this.settings.neuralVerdict = null;
-        if (this.neural && !this.neural.driver) this.neural = null;
+      this.settings.neuralVerdict = null;
+      const n = this.neural;
+      if (n && (!n.driver || ['disabled', 'error', 'disposed'].includes(n.driver.state))) {
+        if (n.driver) n.driver.dispose();
+        this.neural = null;
       }
       this._neuralEnsure();
     }
@@ -1616,7 +1618,9 @@ export class App extends EventEmitter {
         eulerRatio: NET.eulerRatio,
         guard: { windowTicks: NET.guardWindowTicks, slowMs: NET.slowMs, disableMs: NET.disableMs },
         onStatus: (s) => this._onNeuralStatus(s),
-        onError: (e) => { if (!n.fallback) n.fallback = e && e.message ? e.message : String(e); },
+        // onStatus('error') supplies the short HUD notice first; keep the actual cause for
+        // diagnostics (for example a worker timeout) instead of retaining only that notice.
+        onError: (e) => { n.fallback = e && e.message ? e.message : String(e); },
         onPose: () => { n.poses++; },
       });
     } catch (e) {

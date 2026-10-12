@@ -33,9 +33,11 @@ const S = {
   mapOut: { Positions: null, RootMotion: null },
   trackOut: { VelocitiesV2: null, Positions: null, Rotations: null, FootContactLabels: null, RootMotion: null },
   cfg: { inferEvery: 1, telemetry: false, telemetryTicks: 2000, set: 'leader' },
+  initializing: false,
   ready: false,
   busy: false,
   disposed: false,
+  generation: 0,      // reset/dispose invalidates completions already awaiting ORT
   frameCount: 0,
   inferCount: 0,
   dropped: 0,
@@ -47,6 +49,7 @@ const S = {
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
 function post(msg, transfer) {
+  if (S.disposed) return;
   if (transfer) self.postMessage(msg, transfer); else self.postMessage(msg);
 }
 
@@ -161,21 +164,29 @@ async function init(msg) {
   const [meta, skeleton, initPose] = await Promise.all([
     fetchJson(modelsUrl + 'meta.json'), fetchJson(modelsUrl + 'skeleton.json'), fetchJson(modelsUrl + 'init_pose.json'),
   ]);
+  if (S.disposed) return;
   const mapMeta = meta.models && meta.models['mapping_' + S.cfg.set];
   const trackMeta = meta.models && meta.models['tracking_' + S.cfg.set];
   if (!mapMeta || !trackMeta) throw new Error('meta.json has no mapping_/tracking_' + S.cfg.set);
 
   const ort = await loadOrt(msg.ortUrl, msg.wasmDir, msg.numThreads, msg.simd);
+  if (S.disposed) return;
   S.ort = ort;
 
   const mapBytes = await fetchBytes(modelsUrl + mapMeta.file, 'mapping');
+  if (S.disposed) return;
   const trackBytes = await fetchBytes(modelsUrl + trackMeta.file, 'tracking');
+  if (S.disposed) return;
   const m = await createSession(ort, mapBytes, 'mapping');
+  // Retain each created session immediately, including a session that finishes after dispose,
+  // so the initialization finalizer can release it without racing create/run.
+  S.mapping = m.session;
+  if (S.disposed) return;
   const t = await createSession(ort, trackBytes, 'tracking');
+  S.tracking = t.session;
+  if (S.disposed) return;
   checkSignature(m.session, 'mapping', MAPPING_INPUT_NAMES, MAPPING_OUTPUT_NAMES);
   checkSignature(t.session, 'tracking', TRACKING_INPUT_NAMES, TRACKING_OUTPUT_NAMES);
-  S.mapping = m.session;
-  S.tracking = t.session;
 
   S.pipeline = new DPPipeline({
     skeleton, initPose,
@@ -189,8 +200,10 @@ async function init(msg) {
   // warm-up (JIT of the wasm kernels); the pipeline state is untouched
   const w0 = now();
   await S.mapping.run(S.mapFeeds);
+  if (S.disposed) return;
   const w1 = now();
   await S.tracking.run(S.trackFeeds);
+  if (S.disposed) return;
   const w2 = now();
 
   S.ready = true;
@@ -217,37 +230,52 @@ function onFrame(msg) {
   S.frameCount++;
   if (S.busy) { S.dropped++; return; }
   if (S.cfg.inferEvery > 1 && (S.frameCount % S.cfg.inferEvery) !== 0) return;
-  runInference(msg.t, msg.seq).catch((e) => { S.busy = false; fail('run', e); });
+  runInference(msg.t, msg.seq);
 }
 
 async function runInference(t, seq) {
   S.busy = true;
   const p = S.pipeline;
-  const t0 = now();
-  p.buildMappingInputs();
-  const mres = await S.mapping.run(S.mapFeeds);
-  S.mapOut.Positions = mres.Positions.data;
-  S.mapOut.RootMotion = mres.RootMotion.data;
-  p.applyMappingOutputs(S.mapOut);
-  const t1 = now();
-  p.buildTrackingInputs();
-  const tres = await S.tracking.run(S.trackFeeds);
-  for (const n of TRACKING_OUTPUT_NAMES) S.trackOut[n] = tres[n].data;
-  const pose = p.applyTrackingOutputs(S.trackOut, 0);
-  const t2 = now();
-  S.inferCount++;
+  const generation = S.generation;
+  const tick = p.tick;
+  try {
+    const t0 = now();
+    // This snapshots the mapping window/root. Busy frames may update the history ring, but
+    // never rebuild these feeds while a run is in flight.
+    p.buildMappingInputs();
+    const mres = await S.mapping.run(S.mapFeeds);
+    if (S.disposed || generation !== S.generation) return;
+    S.mapOut.Positions = mres.Positions.data;
+    S.mapOut.RootMotion = mres.RootMotion.data;
+    p.applyMappingOutputs(S.mapOut);
+    const t1 = now();
+    p.buildTrackingInputs();
+    const tres = await S.tracking.run(S.trackFeeds);
+    if (S.disposed || generation !== S.generation) return;
+    for (const n of TRACKING_OUTPUT_NAMES) S.trackOut[n] = tres[n].data;
+    const pose = p.applyTrackingOutputs(S.trackOut, 0);
+    pose.tick = tick; // p.tick can have advanced with busy frames; seq/t belong to this snapshot.
+    const t2 = now();
+    S.inferCount++;
 
-  const buffer = S.pool.length ? S.pool.pop() : new ArrayBuffer(POSE_BUFFER_BYTES);
-  new Float32Array(buffer, 0, POSE_FLOATS).set(pose.positionsWorldS);
-  new Float32Array(buffer, POSE_FLOATS * 4, 3).set(pose.rootS);
-  new Float32Array(buffer, (POSE_FLOATS + 3) * 4, 4).set(pose.contacts);
-  post({
-    type: 'pose', tick: pose.tick, t, seq, buffer, rootYawS: pose.rootYawS, clamps: pose.clamps,
-    inferenceMs: t2 - t0, mappingMs: t1 - t0, trackingMs: t2 - t1, dropped: S.dropped, inferCount: S.inferCount,
-  }, [buffer]);
+    const buffer = S.pool.length ? S.pool.pop() : new ArrayBuffer(POSE_BUFFER_BYTES);
+    new Float32Array(buffer, 0, POSE_FLOATS).set(pose.positionsWorldS);
+    new Float32Array(buffer, POSE_FLOATS * 4, 3).set(pose.rootS);
+    new Float32Array(buffer, (POSE_FLOATS + 3) * 4, 4).set(pose.contacts);
+    post({
+      type: 'pose', tick: pose.tick, t, seq, buffer, rootYawS: pose.rootYawS, clamps: pose.clamps,
+      inferenceMs: t2 - t0, mappingMs: t1 - t0, trackingMs: t2 - t1, dropped: S.dropped, inferCount: S.inferCount,
+    }, [buffer]);
 
-  if (S.cfg.telemetry) recordTelemetry(pose.tick, t);
-  S.busy = false;
+    if (S.cfg.telemetry) recordTelemetry(pose.tick, t);
+  } catch (e) {
+    if (!S.disposed && generation === S.generation) fail('run', e);
+  } finally {
+    // Keep the session exclusive until the cancelled await has actually settled. New frames
+    // can already fill the reset history, but a second run must not use the same ORT session.
+    S.busy = false;
+    if (S.disposed) await releaseSessions();
+  }
 }
 
 function copyF32(a) {
@@ -305,24 +333,33 @@ function exportTelemetry() {
   };
 }
 
+async function releaseSessions() {
+  const mapping = S.mapping, tracking = S.tracking;
+  S.mapping = S.tracking = null;
+  try { if (mapping && mapping.release) await mapping.release(); } catch (e) { /* ignore */ }
+  try { if (tracking && tracking.release) await tracking.release(); } catch (e) { /* ignore */ }
+}
+
 function dispose() {
   S.disposed = true;
   S.ready = false;
-  const rel = async () => {
-    try { if (S.mapping && S.mapping.release) await S.mapping.release(); } catch (e) { /* ignore */ }
-    try { if (S.tracking && S.tracking.release) await S.tracking.release(); } catch (e) { /* ignore */ }
-    S.mapping = S.tracking = null;
-  };
-  rel();
+  S.generation++;
+  // ORT create/run cannot be cancelled. Their finalizers own release until they settle.
+  if (!S.initializing && !S.busy) releaseSessions();
 }
 
 self.onmessage = (ev) => {
   const msg = ev.data;
-  if (!msg || typeof msg !== 'object') return;
+  if (!msg || typeof msg !== 'object' || S.disposed) return;
   try {
     switch (msg.type) {
       case 'init':
-        init(msg).catch((e) => fail('init', e));
+        if (S.initializing || S.ready) break;
+        S.initializing = true;
+        init(msg).catch((e) => { if (!S.disposed) fail('init', e); }).finally(async () => {
+          if (!S.ready) await releaseSessions();
+          S.initializing = false;
+        });
         break;
       case 'frame':
         onFrame(msg);
@@ -339,6 +376,7 @@ self.onmessage = (ev) => {
         }
         break;
       case 'reset':
+        S.generation++;
         if (S.pipeline) S.pipeline.reset();
         S.frameCount = 0;
         S.dropped = 0;

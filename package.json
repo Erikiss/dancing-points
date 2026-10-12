@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/unit/*.test.js",
-    "test:e2e": "node --test tests/e2e/*.test.js",
+    "test:e2e": "node --test --test-concurrency=1 tests/e2e/*.test.js",
+    "test:performance": "node --test tests/unit/avatar-driver-performance.test.js tests/unit/worker-regressions.test.js && node --test tests/e2e/performance-guard.test.js",
     "test:all": "npm test && npm run test:e2e",
     "start": "node server/server.js --http",
     "start:http": "node server/server.js --http --no-https",

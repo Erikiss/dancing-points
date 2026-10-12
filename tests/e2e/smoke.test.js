@@ -296,8 +296,10 @@ test('(d) avatar=neural: the worker produces poses (mirror body) or reports a fa
   if (info.poses >= 1) {
     assert.ok(info.pose.finite, 'pose values finite');
     assert.ok(info.pose.headY > 1.0 && info.pose.headY < 2.0, `plausible head height ${info.pose.headY}`);
+  }
+  if (['running', 'slow'].includes(info.driverState)) {
+    assert.ok(info.poses >= 1, 'active neural avatar has produced a pose');
     assert.equal(info.mirrorBody, true, 'the mirror shows the full body');
-    assert.ok(['running', 'slow'].includes(info.driverState), `driver state ${info.driverState}`);
   } else {
     assert.ok(typeof info.fallback === 'string' && info.fallback.length > 0, 'fallback reason documented');
     console.log(`# neural fallback: ${info.fallback}`);
