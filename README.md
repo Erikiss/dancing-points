@@ -187,6 +187,7 @@ JSON. Referenzimplementierung, Fixtures und Parity‑Tests: `tools/dp_pipeline.p
 npm install                 # Root + server/
 npm test                    # Unit-Tests (node --test): Scoring, Choreos, Pipeline-Parität, Server, Duo
 npm run test:e2e            # Playwright, headless Chromium: Boot, Scoring, Neural-Worker, Aufnahme, Duo
+npm run test:performance    # kontrollierte 20/35/70-ms- und Worker-Lifecycle-Regressionen (CPU + Browser)
 npm run gen:choreos         # prozedurale Choreografien neu erzeugen
 node tests/net/worker-smoke.mjs   # Inferenz-Worker im Browser messen (optional)
 ```
@@ -195,6 +196,14 @@ CI (`.github/workflows/ci.yml`) führt Unit‑ und E2E‑Tests aus; `pages.yml` 
 Alles ist ohne Bundler in ES‑Modulen geschrieben (three.js r170 und onnxruntime‑web 1.20.1 sind
 unter `webxr/vendor/` eingebunden), sodass die App auch von einem USB‑Stick‑Server läuft – nur nicht
 direkt von `file://`.
+
+Die Performance-Regressionen verwenden die vorhandene Emulation und Python-Fixtures. Sie prüfen
+die Guard-Schwellen einschließlich Hysterese, verspätete Worker-Antworten, Stop/Reset/Neustart,
+langsames Laden und echte Browser-Isolation mit bzw. ohne COOP-/COEP-Header. Im Browser werden
+nur die ORT-Sessions durch kontrolliert verzögerte Fixture-Ausgaben ersetzt; die App, Pipeline
+und Worker-Nachrichten laufen unverändert. Das prüft die Umschaltlogik und den Renderfortschritt,
+**keine Quest-2-Leistung**. Details und Messgrenzen:
+[`docs/PERFORMANCE_GUARD_TESTS.md`](docs/PERFORMANCE_GUARD_TESTS.md).
 
 ## Roadmap
 

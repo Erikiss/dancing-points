@@ -61,6 +61,10 @@ run of both models happens before `ready`.
 Frames may arrive faster than inference runs: every frame is pushed into the 30 Hz history ring,
 but a new inference starts only when the previous one has finished (`busy` → the frame is counted
 as `dropped`) and only every `inferEvery`‑th frame (the guard sets 2 = 15 Hz).
+The mapping snapshot, input `seq`/time and reported pose/telemetry tick stay associated even
+when the history advances during an asynchronous run. Reset invalidates pending completions
+and their errors; it does not start another ORT run until the old one has settled. Dispose
+suppresses later messages and releases sessions after pending create/run calls finish.
 
 ### Message protocol
 
@@ -128,10 +132,28 @@ calibration.stageToWorld(out, p, calibration.h0);   // scale 1
   `inferEvery = 2` (15 Hz, state `slow`), back to 30 Hz below 17.5 ms; > 60 ms → the worker is
   terminated, state `disabled`, notice `'Neural-Avatar deaktiviert (zu langsam)'` — the app then
   shows the `PointAvatar`. `?avatar=points|off` is handled by the app (do not create the driver).
+* The XR render guard evaluates 90-frame windows (median > 15 ms → 15 Hz; > 22 ms in two
+  consecutive windows, or while already at 15 Hz, → disabled). Inference recovery also requires
+  a healthy render window if rendering caused the slowdown. Stop/reset discards incomplete
+  render windows, while retaining the chosen rate until a fresh window permits recovery.
+* **Worker liveness**: `initTimeoutMs` (default 120000) bounds model loading and warm-up;
+  `responseTimeoutMs` (default 2000) bounds missing inference responses while feeding frames.
+  After `inferEvery` new input frames without a pose, a response is expected. More input does
+  not extend that deadline. Valid poses refresh it; stop/reset cancels it. These are configurable
+  wall-clock deadlines, separate from the 25/60 ms moving-average performance thresholds.
+  Timeouts terminate the worker and enter `error` with point-avatar fallback; they do not save
+  a "too slow" verdict. Pending init/telemetry promises reject on error, disable or dispose.
+* Stop/reset excludes replies from the old input sequence, and duplicate/out-of-order replies
+  are ignored. Late `ready` or `error` messages cannot revive a terminated driver. Choosing
+  `Neural` in the app settings creates a fresh driver after a terminal fallback.
 * `setConfig({rootCorrection, eulerRatio, telemetry})`, `reset()`, `stop()`, `dispose()`,
   `exportTelemetry() → Promise<object>`, `downloadTelemetry(filename?)` (browser only).
 * Pose buffers are transferred worker → main and handed back (`recycle`) — no per‑tick garbage
   beyond the small message objects and the 52‑byte frame copy.
+
+Deterministic CPU and delayed-browser regressions: `npm run test:performance`.
+See [`../../../docs/PERFORMANCE_GUARD_TESTS.md`](../../../docs/PERFORMANCE_GUARD_TESTS.md) for
+coverage, reproduction commands and the distinction between controlled delay and real ONNX work.
 
 ## 4. Swapping / improving models
 
